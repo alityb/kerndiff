@@ -1,0 +1,1 @@
+{"ld.global": 31, "st.shared": 48, "ld.shared": 28, "fma.rn": 96, "add.s32": 18, "mul.lo.s32": 9, "setp.lt.s32": 6, "bar.sync": 4}

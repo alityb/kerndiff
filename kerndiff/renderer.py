@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from kerndiff.diff import MetricDelta
+from kerndiff.metrics import fmt_int, fmt_kb
+from kerndiff.profiler import ProfileResult
+from kerndiff.roofline import RooflineResult
+
+ANSI = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "red": "\033[31m",
+}
+
+
+def _color(text: str, code: str, use_color: bool) -> str:
+    if not use_color or not code:
+        return text
+    return f"{ANSI[code]}{text}{ANSI['reset']}"
+
+
+def _style_symbol(symbol: str, use_color: bool) -> str:
+    if symbol == "++":
+        return f"{ANSI['green']}{ANSI['bold']}{symbol}{ANSI['reset']}" if use_color else symbol
+    if symbol == "+":
+        return _color(symbol, "green", use_color)
+    if symbol == "~":
+        return _color(symbol, "dim", use_color)
+    if symbol == "-":
+        return _color(symbol, "yellow", use_color)
+    if symbol == "--":
+        return f"{ANSI['red']}{ANSI['bold']}{symbol}{ANSI['reset']}" if use_color else symbol
+    return symbol
+
+
+def format_delta(delta: MetricDelta) -> str:
+    metric = delta.metric
+    if metric.unit == "%":
+        return f"{delta.v2 - delta.v1:+.1f}pp"
+    if metric.unit in {"us", "GB/s", "inst", "count"}:
+        return f"{delta.delta_pct:+.1f}%"
+    # unit == "int" or "B": show raw integer diff
+    raw_diff = delta.v2 - delta.v1
+    if metric.unit == "B":
+        value = fmt_kb(abs(raw_diff))
+    else:
+        value = fmt_int(abs(raw_diff))
+    sign = "+" if raw_diff >= 0 else "-"
+    return f"{sign}{value}"
+
+
+def render_verdict(verdict: dict, use_color: bool = True) -> str:
+    if verdict["direction"] == "unchanged":
+        pct = abs(verdict["latency_delta_pct"])
+        text = (
+            f"  no significant change  ({verdict['v1_latency_us']:.1f}us -> {verdict['v2_latency_us']:.1f}us, "
+            f"{pct:.1f}% within noise floor)"
+        )
+        return _color(text, "dim", use_color)
+    if verdict["direction"] == "improvement":
+        label = _color(verdict["label"], "green", use_color)
+        label = f"{ANSI['bold']}{label}{ANSI['reset']}" if use_color else label
+    else:
+        label = _color(verdict["label"], "red", use_color)
+        label = f"{ANSI['bold']}{label}{ANSI['reset']}" if use_color else label
+    return (
+        f"  {label}  ({verdict['v1_latency_us']:.1f}us -> {verdict['v2_latency_us']:.1f}us)  "
+        f"[v1: {verdict['v1_min_us']:.0f}-{verdict['v1_max_us']:.0f}us +/-{verdict['v1_cv_pct']:.0f}%  "
+        f"v2: {verdict['v2_min_us']:.0f}-{verdict['v2_max_us']:.0f}us +/-{verdict['v2_cv_pct']:.0f}%]"
+    ).replace("+/-", "±")
+
+
+def render_metric_table(
+    deltas: list[MetricDelta],
+    v1: ProfileResult,
+    v2: ProfileResult,
+    roofline: RooflineResult | None = None,
+    roofline_v1_bw: float | None = None,
+    roofline_v1_compute: float | None = None,
+    use_color: bool = True,
+) -> str:
+    rows = []
+    for delta in deltas:
+        left = delta.metric.display_name
+        v1_text = delta.metric.format_fn(delta.v1)
+        v2_text = delta.metric.format_fn(delta.v2)
+        if delta.metric.key == "latency_us":
+            v1_text = f"{v1_text} ±{v1.cv_pct:.0f}%"
+            v2_text = f"{v2_text} ±{v2.cv_pct:.0f}%"
+        rows.append((left, v1_text, v2_text, format_delta(delta), _style_symbol(delta.symbol, use_color)))
+    name_w = max(22, len("metric"), *(len(row[0]) for row in rows))
+    v1_w = max(14, len("v1"), *(len(row[1]) for row in rows))
+    v2_w = max(14, len("v2"), *(len(row[2]) for row in rows))
+    delta_w = max(10, len("delta"), *(len(row[3]) for row in rows))
+    lines = [
+        f"  {'metric':<{name_w}}  {'v1':>{v1_w}}  {'v2':>{v2_w}}  {'delta':>{delta_w}}",
+        f"  {'-' * (name_w + v1_w + v2_w + delta_w + 6)}",
+    ]
+    for left, v1_text, v2_text, delta_text, symbol in rows:
+        lines.append(f"  {left:<{name_w}}  {v1_text:>{v1_w}}  {v2_text:>{v2_w}}  {delta_text:>{delta_w}}  {symbol}")
+    if roofline and roofline.gpu_matched:
+        lines.append(f"  {'-' * (name_w + v1_w + v2_w + delta_w + 6)}")
+        if roofline.bound == "compute":
+            v1_util = roofline_v1_compute if roofline_v1_compute is not None else 0.0
+            v2_util = roofline.compute_utilization
+            v1_text = f"{v1_util * 100:.0f}%sm"
+            v2_text = f"{v2_util * 100:.0f}%sm"
+        else:
+            v1_util = roofline_v1_bw if roofline_v1_bw is not None else 0.0
+            v2_text = f"{roofline.bw_utilization * 100:.0f}%bw"
+            v1_text = f"{v1_util * 100:.0f}%bw"
+        lines.append(
+            f"  {'roofline [' + roofline.bound + ']':<{name_w}}  "
+            f"{v1_text:>{v1_w}}  "
+            f"{v2_text:>{v2_w}}  "
+            f"{f'{roofline.headroom_pct:.0f}% headroom':>{delta_w}}"
+        )
+    return "\n".join(lines)
+
+
+def render_ptx_diff(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    name_w = max(18, *(len(r["instruction"]) for r in rows))
+    v1_w = max(6, *(len(str(r["v1"])) for r in rows))
+    v2_w = max(6, *(len(str(r["v2"])) for r in rows))
+    delta_w = max(10, *(len(f"{r['delta_pct']:+.1f}%") for r in rows))
+    lines = [
+        "  ptx diff",
+        f"  {'-' * (name_w + v1_w + v2_w + delta_w + 6)}",
+        f"  {'instruction':<{name_w}}  {'v1':>{v1_w}}  {'v2':>{v2_w}}  {'delta':>{delta_w}}",
+    ]
+    for row in rows:
+        lines.append(
+            f"  {row['instruction']:<{name_w}}  {row['v1']:>{v1_w}}  {row['v2']:>{v2_w}}  {row['delta_pct']:+{delta_w}.1f}%"
+        )
+    return "\n".join(lines)
+
+
+def build_json_payload(
+    *,
+    hardware,
+    kernel_name: str,
+    file_a: str,
+    file_b: str,
+    actual_runs: int,
+    max_runs: int,
+    min_runs: int,
+    noise_threshold: float,
+    warmup: int,
+    l2_flush: bool,
+    verdict: dict,
+    deltas: list[MetricDelta],
+    roofline: RooflineResult | None,
+    roofline_v1_bw: float | None = None,
+    ptx_diff: list[dict],
+    warnings: list[str],
+) -> dict:
+    payload = {
+        "hardware": {
+            "gpu": hardware.gpu_name,
+            "sm_clock_mhz": hardware.sm_clock_mhz,
+            "mem_clock_mhz": hardware.mem_clock_mhz,
+            "driver": hardware.driver_version,
+            "clocks_locked": hardware.clocks_locked,
+            "mock": hardware.mock,
+        },
+        "kernel": kernel_name,
+        "v1": {"file": file_a},
+        "v2": {"file": file_b},
+        "actual_runs": actual_runs,
+        "max_runs": max_runs,
+        "min_runs": min_runs,
+        "noise_threshold": noise_threshold,
+        "warmup": warmup,
+        "l2_flush": l2_flush,
+        "verdict": {k: verdict[k] for k in [
+            "speedup", "direction", "label", "v1_latency_us", "v2_latency_us",
+            "v1_min_us", "v1_max_us", "v1_cv_pct", "v2_min_us", "v2_max_us", "v2_cv_pct",
+        ]},
+        "deltas": [
+            {
+                "metric": delta.metric.key,
+                "group": delta.metric.group,
+                "lower_is_better": delta.metric.lower_is_better,
+                "v1": delta.v1,
+                "v2": delta.v2,
+                "delta_pct": delta.delta_pct,
+                "symbol": delta.symbol,
+            }
+            for delta in deltas
+        ],
+        "ptx_diff": ptx_diff,
+        "warnings": warnings,
+    }
+    if roofline and roofline.gpu_matched:
+        payload["roofline"] = {
+            "bound": roofline.bound,
+            "v1_bw_utilization": roofline_v1_bw if roofline_v1_bw is not None else roofline.bw_utilization,
+            "v2_bw_utilization": roofline.bw_utilization,
+            "headroom_pct": roofline.headroom_pct,
+            "gpu_matched": roofline.gpu_matched,
+        }
+    return payload
+
+
+def write_output(text: str, output_file: str | None) -> None:
+    if output_file:
+        Path(output_file).write_text(text)
+    else:
+        print(text)
+
+
+def render_json(payload: dict) -> str:
+    return json.dumps(payload, indent=2)

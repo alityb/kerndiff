@@ -1,0 +1,255 @@
+from __future__ import annotations
+
+import os
+import random
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from statistics import mean, median, stdev
+
+from kerndiff.metrics import METRICS_BY_NCU
+from kerndiff.parser import parse_ncu_csv
+
+
+@dataclass
+class HardwareInfo:
+    gpu_name: str
+    sm_clock_mhz: int
+    mem_clock_mhz: int
+    driver_version: str
+    clocks_locked: bool
+    mock: bool
+
+
+MOCK_HARDWARE = HardwareInfo(
+    gpu_name="NVIDIA H100 SXM5 80GB",
+    sm_clock_mhz=1980,
+    mem_clock_mhz=2619,
+    driver_version="535.104.12",
+    clocks_locked=True,
+    mock=True,
+)
+
+
+@dataclass
+class ProfileResult:
+    kernel_name: str
+    metrics: dict[str, float]
+    min_latency_us: float
+    all_latencies_us: list[float]
+    cv_pct: float
+    ptx_instructions: dict[str, int]
+    hardware: HardwareInfo
+    warnings: list[str]
+    actual_runs: int
+    max_runs: int
+    min_runs: int
+    noise_threshold: float
+    warmup: int
+    l2_flush: bool
+
+
+def query_hardware(gpu_id: int) -> HardwareInfo:
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=name,clocks.sm,clocks.mem,driver_version",
+            "--format=csv,noheader,nounits",
+            "-i",
+            str(gpu_id),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return HardwareInfo("unknown", 0, 0, "unknown", False, False)
+    parts = [p.strip() for p in result.stdout.strip().split(",")]
+    if len(parts) < 4:
+        return HardwareInfo("unknown", 0, 0, "unknown", False, False)
+    return HardwareInfo(
+        gpu_name=parts[0],
+        sm_clock_mhz=int(parts[1]) if parts[1].isdigit() else 0,
+        mem_clock_mhz=int(parts[2]) if parts[2].isdigit() else 0,
+        driver_version=parts[3],
+        clocks_locked=False,
+        mock=False,
+    )
+
+
+def query_l2_size(gpu_id: int) -> int:
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=l2_cache", "--format=csv,noheader,nounits", "-i", str(gpu_id)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return 40 * 1024 * 1024  # 40MB fallback (H100)
+    try:
+        return int(result.stdout.strip()) * 1024
+    except ValueError:
+        return 40 * 1024 * 1024
+
+
+def lock_clocks(gpu_id: int) -> bool:
+    r1 = subprocess.run(["nvidia-smi", "--lock-gpu-clocks=tdp,tdp", "-i", str(gpu_id)], capture_output=True)
+    r2 = subprocess.run(["nvidia-smi", "--lock-memory-clocks=max", "-i", str(gpu_id)], capture_output=True)
+    return r1.returncode == 0 and r2.returncode == 0
+
+
+def unlock_clocks(gpu_id: int) -> None:
+    subprocess.run(["nvidia-smi", "--reset-gpu-clocks", "-i", str(gpu_id)], capture_output=True)
+    subprocess.run(["nvidia-smi", "--reset-memory-clocks", "-i", str(gpu_id)], capture_output=True)
+
+
+def _compute_cv(values: list[float]) -> float:
+    return (stdev(values) / mean(values)) * 100.0 if len(values) > 1 else 0.0
+
+
+def _synthesize_latencies(min_latency_us: float, runs: int) -> list[float]:
+    rng = random.Random(42)
+    latencies = [min_latency_us]
+    for _ in range(max(runs - 1, 0)):
+        latencies.append(min_latency_us * (1.0 + rng.uniform(0.0, 0.04)))
+    return latencies
+
+
+def profile(
+    binary: str,
+    kernel_name: str,
+    max_runs: int,
+    min_runs: int,
+    noise_threshold: float,
+    warmup: int,
+    gpu_id: int,
+    hardware: HardwareInfo,
+    mock: bool = False,
+    mock_prefix: str = "v1",
+    env: dict | None = None,
+) -> ProfileResult:
+    warnings: list[str] = []
+
+    if mock:
+        fixture_path = Path(__file__).resolve().parent / "fixtures" / f"{mock_prefix}_ncu.csv"
+        metrics = parse_ncu_csv(fixture_path.read_text())
+        min_latency_us = metrics.get("latency_us", 0.0)
+        all_latencies_us = _synthesize_latencies(min_latency_us, 20)
+        cv_pct = _compute_cv(all_latencies_us)
+        metrics["latency_us"] = min_latency_us
+        return ProfileResult(
+            kernel_name=kernel_name,
+            metrics=metrics,
+            min_latency_us=min_latency_us,
+            all_latencies_us=all_latencies_us,
+            cv_pct=cv_pct,
+            ptx_instructions={},
+            hardware=MOCK_HARDWARE,
+            warnings=warnings,
+            actual_runs=20,
+            max_runs=50,
+            min_runs=10,
+            noise_threshold=1.0,
+            warmup=warmup,
+            l2_flush=False,
+        )
+
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+
+    l2_size_bytes = query_l2_size(gpu_id)
+
+    # Warmup — no L2 flush
+    subprocess.run(
+        [binary, "--kernel", kernel_name, "--iters", str(warmup)],
+        check=True,
+        env=run_env,
+    )
+
+    # Adaptive timed runs with L2 flush
+    latencies: list[float] = []
+    cv_pct = float("inf")
+
+    while len(latencies) < min_runs or (cv_pct > noise_threshold and len(latencies) < max_runs):
+        r = subprocess.run(
+            [binary, "--kernel", kernel_name, "--iters", "1", "--l2-flush", str(l2_size_bytes)],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=run_env,
+        )
+        latencies.append(float(r.stdout.strip()))
+        if len(latencies) >= 2:
+            cv_pct = _compute_cv(latencies)
+
+    min_latency_us = min(latencies)
+    cv_pct = _compute_cv(latencies)
+
+    if cv_pct > noise_threshold and len(latencies) >= max_runs:
+        warnings.append(
+            f"noise threshold ({noise_threshold}%) not reached after {max_runs} runs "
+            f"(cv={cv_pct:.1f}%). Consider clock locking or --noise-threshold {cv_pct:.0f}."
+        )
+
+    med = median(latencies)
+    if latencies[0] > med * 1.3:
+        warnings.append(
+            f"first run was {int((latencies[0] / med - 1) * 100)}% slower than median. "
+            f"Consider --warmup (currently {warmup})."
+        )
+
+    if max(latencies) / min_latency_us > 1.15:
+        warnings.append(
+            f"high variance detected (min={min_latency_us:.1f}us, max={max(latencies):.1f}us). Clock locking recommended."
+        )
+
+    ncu_metric_names = ",".join(METRICS_BY_NCU.keys())
+    ncu_result = subprocess.run(
+        [
+            "ncu",
+            "--csv",
+            "--metrics",
+            ncu_metric_names,
+            "--launch-count",
+            "1",
+            "--cache-control",
+            "flush_all",
+            "--clock-control",
+            "base",
+            binary,
+            "--kernel",
+            kernel_name,
+            "--iters",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        env=run_env,
+    )
+
+    if not ncu_result.stdout.strip():
+        warnings.append(
+            "NCU returned no output. Check permissions or try: "
+            "sudo ncu ... or set /proc/sys/kernel/perf_event_paranoid to 0"
+        )
+        metrics = {}
+    else:
+        metrics = parse_ncu_csv(ncu_result.stdout)
+
+    metrics["latency_us"] = min_latency_us
+
+    return ProfileResult(
+        kernel_name=kernel_name,
+        metrics=metrics,
+        min_latency_us=min_latency_us,
+        all_latencies_us=latencies,
+        cv_pct=cv_pct,
+        ptx_instructions={},
+        hardware=hardware,
+        warnings=warnings,
+        actual_runs=len(latencies),
+        max_runs=max_runs,
+        min_runs=min_runs,
+        noise_threshold=noise_threshold,
+        warmup=warmup,
+        l2_flush=True,
+    )
