@@ -25,16 +25,18 @@ def _color(text: str, code: str, use_color: bool) -> str:
 
 
 def _style_symbol(symbol: str, use_color: bool) -> str:
+    if not use_color:
+        return symbol
     if symbol == "++":
-        return f"{ANSI['green']}{ANSI['bold']}{symbol}{ANSI['reset']}" if use_color else symbol
+        return f"{ANSI['bold']}{ANSI['green']}{symbol}{ANSI['reset']}"
     if symbol == "+":
-        return _color(symbol, "green", use_color)
+        return f"{ANSI['green']}{symbol}{ANSI['reset']}"
     if symbol == "~":
-        return _color(symbol, "dim", use_color)
+        return symbol
     if symbol == "-":
-        return _color(symbol, "yellow", use_color)
+        return f"{ANSI['red']}{symbol}{ANSI['reset']}"
     if symbol == "--":
-        return f"{ANSI['red']}{ANSI['bold']}{symbol}{ANSI['reset']}" if use_color else symbol
+        return f"{ANSI['bold']}{ANSI['red']}{symbol}{ANSI['reset']}"
     return symbol
 
 
@@ -54,12 +56,13 @@ def format_delta(delta: MetricDelta) -> str:
     return f"{sign}{value}"
 
 
-def render_verdict(verdict: dict, use_color: bool = True) -> str:
+def render_verdict(verdict: dict, use_color: bool = True, clocks_locked: bool = True) -> str:
     if verdict["direction"] == "unchanged":
         pct = abs(verdict["latency_delta_pct"])
+        noise_note = f", delta within ±{verdict['v1_cv_pct']:.0f}% noise" if not clocks_locked else ""
         text = (
-            f"  no significant change  ({verdict['v1_latency_us']:.1f}us -> {verdict['v2_latency_us']:.1f}us, "
-            f"{pct:.1f}% within noise floor)"
+            f"  no significant latency change  ({verdict['v1_latency_us']:.1f}us vs {verdict['v2_latency_us']:.1f}us"
+            f"{noise_note})"
         )
         return _color(text, "dim", use_color)
     if verdict["direction"] == "improvement":
@@ -68,11 +71,14 @@ def render_verdict(verdict: dict, use_color: bool = True) -> str:
     else:
         label = _color(verdict["label"], "red", use_color)
         label = f"{ANSI['bold']}{label}{ANSI['reset']}" if use_color else label
-    return (
+    line = (
         f"  {label}  ({verdict['v1_latency_us']:.1f}us -> {verdict['v2_latency_us']:.1f}us)  "
         f"[v1: {verdict['v1_min_us']:.0f}-{verdict['v1_max_us']:.0f}us +/-{verdict['v1_cv_pct']:.0f}%  "
         f"v2: {verdict['v2_min_us']:.0f}-{verdict['v2_max_us']:.0f}us +/-{verdict['v2_cv_pct']:.0f}%]"
     ).replace("+/-", "±")
+    if not clocks_locked:
+        line += "\n  note: clocks not locked — deltas below 10% may not be reliable"
+    return line
 
 
 def render_metric_table(
@@ -80,9 +86,12 @@ def render_metric_table(
     v1: ProfileResult,
     v2: ProfileResult,
     roofline: RooflineResult | None = None,
+    roofline_v1: RooflineResult | None = None,
     roofline_v1_bw: float | None = None,
     roofline_v1_compute: float | None = None,
     use_color: bool = True,
+    total_hbm: tuple[float, float] | None = None,
+    noise_ceiling: float = 0.0,
 ) -> str:
     rows = []
     for delta in deltas:
@@ -92,7 +101,22 @@ def render_metric_table(
         if delta.metric.key == "latency_us":
             v1_text = f"{v1_text} ±{v1.cv_pct:.0f}%"
             v2_text = f"{v2_text} ±{v2.cv_pct:.0f}%"
-        rows.append((left, v1_text, v2_text, format_delta(delta), _style_symbol(delta.symbol, use_color)))
+
+        symbol = delta.symbol
+        styled_symbol = _style_symbol(symbol, use_color)
+
+        # Add ? for uncertain deltas (not latency — it has ±cv% already)
+        uncertain = False
+        if noise_ceiling > 0 and delta.metric.key != "latency_us":
+            if abs(delta.delta_pct) < noise_ceiling and symbol not in ("~",):
+                uncertain = True
+
+        if uncertain:
+            question = _color("?", "dim", use_color)
+            styled_symbol = f"{styled_symbol} {question}"
+
+        rows.append((left, v1_text, v2_text, format_delta(delta), styled_symbol))
+
     name_w = max(22, len("metric"), *(len(row[0]) for row in rows))
     v1_w = max(14, len("v1"), *(len(row[1]) for row in rows))
     v2_w = max(14, len("v2"), *(len(row[2]) for row in rows))
@@ -103,22 +127,39 @@ def render_metric_table(
     ]
     for left, v1_text, v2_text, delta_text, symbol in rows:
         lines.append(f"  {left:<{name_w}}  {v1_text:>{v1_w}}  {v2_text:>{v2_w}}  {delta_text:>{delta_w}}  {symbol}")
+    # Roofline row — skip if both bw and compute are 0 (no data)
     if roofline and roofline.gpu_matched:
-        lines.append(f"  {'-' * (name_w + v1_w + v2_w + delta_w + 6)}")
-        if roofline.bound == "compute":
-            v1_util = roofline_v1_compute if roofline_v1_compute is not None else 0.0
-            v2_util = roofline.compute_utilization
-            v1_text = f"{v1_util * 100:.0f}%sm"
-            v2_text = f"{v2_util * 100:.0f}%sm"
-        else:
-            v1_util = roofline_v1_bw if roofline_v1_bw is not None else 0.0
-            v2_text = f"{roofline.bw_utilization * 100:.0f}%bw"
-            v1_text = f"{v1_util * 100:.0f}%bw"
+        v1_bw = roofline_v1_bw if roofline_v1_bw is not None else 0.0
+        v1_compute = roofline_v1_compute if roofline_v1_compute is not None else 0.0
+        v2_bw = roofline.bw_utilization
+        v2_compute = roofline.compute_utilization
+        has_data = (v1_bw > 0 or v1_compute > 0 or v2_bw > 0 or v2_compute > 0)
+        if has_data:
+            lines.append(f"  {'-' * (name_w + v1_w + v2_w + delta_w + 6)}")
+            v1_bound = "memory" if v1_bw > v1_compute else "compute"
+            v2_bound = roofline.bound
+            if v1_bound != v2_bound:
+                bound_text = f"bound: {v1_bound[:3]}->{v2_bound[:3]}"
+            else:
+                bound_text = f"bound: {v2_bound}"
+            v1_text = f"{v1_bw * 100:.0f}%bw" if v1_bound == "memory" else f"{v1_compute * 100:.0f}%sm"
+            v2_text = f"{v2_bw * 100:.0f}%bw" if v2_bound == "memory" else f"{v2_compute * 100:.0f}%sm"
+            tail = f"{bound_text}  {roofline.headroom_pct:.0f}% headroom"
+            lines.append(
+                f"  {'roofline':<{name_w}}  "
+                f"{v1_text:>{v1_w}}  "
+                f"{v2_text:>{v2_w}}  "
+                f"{tail:>{delta_w}}"
+            )
+    # Total HBM row (pipeline mode only)
+    if total_hbm is not None:
+        gb_a, gb_b = total_hbm
+        delta_pct = ((gb_b - gb_a) / gb_a * 100) if gb_a > 0 else 0.0
         lines.append(
-            f"  {'roofline [' + roofline.bound + ']':<{name_w}}  "
-            f"{v1_text:>{v1_w}}  "
-            f"{v2_text:>{v2_w}}  "
-            f"{f'{roofline.headroom_pct:.0f}% headroom':>{delta_w}}"
+            f"  {'total_hbm':<{name_w}}  "
+            f"{f'{gb_a:.3f}GB':>{v1_w}}  "
+            f"{f'{gb_b:.3f}GB':>{v2_w}}  "
+            f"{f'{delta_pct:+.1f}%':>{delta_w}}"
         )
     return "\n".join(lines)
 
@@ -153,6 +194,7 @@ def build_json_payload(
     min_runs: int,
     noise_threshold: float,
     warmup: int,
+    buf_elems: int = 1 << 22,
     l2_flush: bool,
     verdict: dict,
     deltas: list[MetricDelta],
@@ -160,6 +202,8 @@ def build_json_payload(
     roofline_v1_bw: float | None = None,
     ptx_diff: list[dict],
     warnings: list[str],
+    total_hbm: tuple[float, float] | None = None,
+    pipeline: int = 1,
 ) -> dict:
     payload = {
         "hardware": {
@@ -178,6 +222,7 @@ def build_json_payload(
         "min_runs": min_runs,
         "noise_threshold": noise_threshold,
         "warmup": warmup,
+        "config": {"buf_elems": buf_elems, "pipeline": pipeline},
         "l2_flush": l2_flush,
         "verdict": {k: verdict[k] for k in [
             "speedup", "direction", "label", "v1_latency_us", "v2_latency_us",
@@ -206,6 +251,8 @@ def build_json_payload(
             "headroom_pct": roofline.headroom_pct,
             "gpu_matched": roofline.gpu_matched,
         }
+    if total_hbm is not None:
+        payload["total_hbm"] = {"v1_gb": total_hbm[0], "v2_gb": total_hbm[1]}
     return payload
 
 
@@ -214,6 +261,23 @@ def write_output(text: str, output_file: str | None) -> None:
         Path(output_file).write_text(text)
     else:
         print(text)
+
+
+def render_shape_table(rows: list[dict]) -> str:
+    """Render a shape sweep summary table.
+
+    Each row has: shape, v1_us, v2_us, speedup, dram_delta, bound.
+    """
+    header = f"  {'shape':>10}  {'v1 (us)':>10}  {'v2 (us)':>10}  {'speedup':>8}  {'dram':>8}  {'bound':>10}"
+    sep = f"  {'-' * 64}"
+    lines = [header, sep]
+    for r in rows:
+        sp = f"{r['speedup']:.2f}x"
+        dram = f"{r['dram_delta']:+.1f}%"
+        lines.append(
+            f"  {r['shape']:>10}  {r['v1_us']:>10.1f}  {r['v2_us']:>10.1f}  {sp:>8}  {dram:>8}  {r['bound']:>10}"
+        )
+    return "\n".join(lines)
 
 
 def render_json(payload: dict) -> str:

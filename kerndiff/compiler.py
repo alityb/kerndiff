@@ -12,6 +12,12 @@ FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 _TEMPLATE = FIXTURES_DIR / "harness_template.cu"
 _TEMP_DIRS: list[str] = []
 
+# Regex to extract __global__ kernel signature: captures fn_name and params
+_SIG_RE = re.compile(
+    r"__global__\s+\w+\s+(\w+)\s*\(([^)]*)\)",
+    re.DOTALL,
+)
+
 DTYPE_MAP = {
     "float":  ("float",  "#include <cuda_runtime.h>"),
     "half":   ("half",   "#include <cuda_fp16.h>"),
@@ -55,7 +61,84 @@ def _find_cuda_lib_dir(nvcc_path: str) -> str | None:
     return None
 
 
-def build_harness(source_path: str, kernel_name: str, kernel_call: str, dtype: str = "float") -> str:
+def parse_kernel_signature(source: str, fn_name: str) -> list[tuple[str, str]]:
+    """Extract parameter (type, name) pairs from a __global__ kernel declaration."""
+    for match in _SIG_RE.finditer(source):
+        if match.group(1) == fn_name:
+            raw_params = match.group(2)
+            params = []
+            for part in raw_params.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                # Remove __restrict__ and const qualifiers
+                cleaned = part.replace("__restrict__", "").replace("const ", "").strip()
+                # Split into type and name: last token is name, rest is type
+                tokens = cleaned.split()
+                if len(tokens) >= 2:
+                    name = tokens[-1].lstrip("*")
+                    ptype = " ".join(tokens[:-1])
+                    # Check if pointer star is on the name side (e.g., "float *a")
+                    if "*" in cleaned and "*" not in ptype:
+                        ptype += "*"
+                    # Normalize: "float *" -> "float*"
+                    ptype = ptype.replace(" *", "*").replace("* ", "*")
+                    params.append((ptype, name))
+                elif len(tokens) == 1:
+                    params.append((tokens[0], ""))
+            return params
+    return []
+
+
+def generate_call(fn_name: str, params: list[tuple[str, str]]) -> tuple[str, list[str]]:
+    """Generate a best-effort kernel call expression from parsed parameters.
+
+    Returns (call_expr, warnings).
+    """
+    if not params:
+        return f"{fn_name}<<<GRID_SIZE, BLOCK_SIZE>>>(d_a, d_b, d_c, N)", []
+
+    warnings: list[str] = []
+    args = []
+    ptr_index = 0
+    ptr_names = ["d_a", "d_b", "d_c"]
+
+    for ptype, pname in params:
+        ptype_lower = ptype.lower().rstrip("*").strip()
+        is_ptr = "*" in ptype
+
+        if is_ptr:
+            if ptr_index < len(ptr_names):
+                args.append(ptr_names[ptr_index])
+                ptr_index += 1
+            else:
+                args.append("nullptr")
+                warnings.append(f"extra pointer param '{pname}' mapped to nullptr — use --call to override")
+        elif ptype_lower in ("int", "unsigned", "unsigned int", "size_t", "long", "long long"):
+            name_lower = pname.lower()
+            if name_lower in ("n", "num", "size", "count", "len", "length", "num_elements", "nelems"):
+                args.append("N")
+            elif "stride" in name_lower:
+                args.append("1")
+            elif "batch" in name_lower:
+                args.append("1")
+            else:
+                args.append("N")
+                if pname:
+                    warnings.append(f"int param '{pname}' mapped to N — use --call to override")
+        elif ptype_lower == "float" and not is_ptr:
+            args.append("1.0f")
+            if pname:
+                warnings.append(f"float param '{pname}' mapped to 1.0f — use --call to override")
+        else:
+            args.append("0")
+            warnings.append(f"unknown param type '{ptype} {pname}' mapped to 0 — use --call to override")
+
+    call = f"{fn_name}<<<GRID_SIZE, BLOCK_SIZE>>>({', '.join(args)})"
+    return call, warnings
+
+
+def build_harness(source_path: str, kernel_name: str, kernel_call: str, dtype: str = "float", buf_elems: int = 1 << 22) -> str:
     temp_dir = tempfile.mkdtemp(prefix="kerndiff_build_")
     _TEMP_DIRS.append(temp_dir)
     harness_path = Path(temp_dir) / "bench.cu"
@@ -69,12 +152,13 @@ def build_harness(source_path: str, kernel_name: str, kernel_call: str, dtype: s
         .replace("{{KERNEL_CALL}}", kernel_call)
         .replace("{{ELEM_TYPE}}", elem_type)
         .replace("{{DTYPE_INCLUDE}}", dtype_include)
+        .replace("{{BUF_ELEMS}}", str(buf_elems))
     )
     harness_path.write_text(harness)
     return str(harness_path)
 
 
-def _format_compile_error(source_path: str, stderr_text: str, nvcc_cmd: list[str], harness_path: str) -> str:
+def _format_compile_error(source_path: str, stderr_text: str, nvcc_cmd: list[str], harness_path: str, auto_call: str | None = None) -> str:
     source_name = os.path.basename(source_path)
     lines = stderr_text.strip().splitlines()
 
@@ -94,9 +178,13 @@ def _format_compile_error(source_path: str, stderr_text: str, nvcc_cmd: list[str
     elif "undefined" in lower:
         hint = "\n  (check --fn matches the kernel name in your source)"
 
+    auto_hint = ""
+    if auto_call:
+        auto_hint = f"\n  hint: auto-generated call was: {auto_call} — use --call to override"
+
     return (
         f"error: compilation failed for {source_name}\n\n"
-        f"  {first_error}{hint}\n\n"
+        f"  {first_error}{hint}{auto_hint}\n\n"
         f"  full output: {harness_path}\n"
         f"  run: {' '.join(nvcc_cmd)}"
     )
@@ -109,12 +197,27 @@ def compile_kernel(
     mock: bool = False,
     kernel_call: str | None = None,
     dtype: str = "float",
+    buf_elems: int = 1 << 22,
 ) -> str:
     if mock:
         return source_path
     nvcc = _find_nvcc()
-    call_expr = kernel_call if kernel_call else f"{kernel_name}<<<GRID_SIZE, BLOCK_SIZE>>>(d_a, d_b, d_c, N)"
-    harness_path = build_harness(source_path, kernel_name, call_expr, dtype=dtype)
+    auto_call = None
+    if kernel_call:
+        call_expr = kernel_call
+    else:
+        call_expr = f"{kernel_name}<<<GRID_SIZE, BLOCK_SIZE>>>(d_a, d_b, d_c, N)"
+        # Try auto-generating from signature
+        try:
+            source = Path(source_path).read_text()
+            params = parse_kernel_signature(source, kernel_name)
+            if params:
+                generated, _ = generate_call(kernel_name, params)
+                call_expr = generated
+                auto_call = generated
+        except Exception:
+            pass
+    harness_path = build_harness(source_path, kernel_name, call_expr, dtype=dtype, buf_elems=buf_elems)
     output_path = str(Path(harness_path).with_suffix(""))
 
     cmd = [nvcc, "-O2", f"-arch={arch}"]
@@ -125,5 +228,52 @@ def compile_kernel(
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise SystemExit(_format_compile_error(source_path, result.stderr or result.stdout or "nvcc failed", cmd, harness_path))
+        raise SystemExit(_format_compile_error(
+            source_path, result.stderr or result.stdout or "nvcc failed", cmd, harness_path,
+            auto_call=auto_call,
+        ))
     return output_path
+
+
+def verify_correctness(
+    binary_a: str,
+    binary_b: str,
+    env: dict | None = None,
+    dump_count: int = 16,
+) -> tuple[float, list[float], list[float]]:
+    """Run both binaries with --dump-output and compare first dump_count elements of d_c.
+
+    Returns (max_diff, v1_values, v2_values).
+    """
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+
+    r1 = subprocess.run(
+        [binary_a, "--dump-output", str(dump_count)],
+        capture_output=True, text=True, env=run_env,
+    )
+    r2 = subprocess.run(
+        [binary_b, "--dump-output", str(dump_count)],
+        capture_output=True, text=True, env=run_env,
+    )
+
+    def parse_values(output: str) -> list[float]:
+        vals = []
+        for line in output.strip().splitlines():
+            try:
+                vals.append(float(line.strip()))
+            except ValueError:
+                continue
+        return vals
+
+    v1_vals = parse_values(r1.stdout or "")
+    v2_vals = parse_values(r2.stdout or "")
+
+    if not v1_vals or not v2_vals:
+        return float("inf"), v1_vals, v2_vals
+
+    max_diff = 0.0
+    for a, b in zip(v1_vals, v2_vals):
+        max_diff = max(max_diff, abs(a - b))
+    return max_diff, v1_vals, v2_vals

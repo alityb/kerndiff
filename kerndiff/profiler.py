@@ -10,7 +10,7 @@ from pathlib import Path
 from statistics import mean, median, stdev
 
 from kerndiff.metrics import METRICS_BY_NCU
-from kerndiff.parser import parse_ncu_csv
+from kerndiff.parser import parse_ncu_csv, parse_ncu_csv_pipeline
 
 
 @dataclass
@@ -169,6 +169,7 @@ def profile(
     mock: bool = False,
     mock_prefix: str = "v1",
     env: dict | None = None,
+    pipeline: int = 1,
 ) -> ProfileResult:
     warnings: list[str] = []
 
@@ -288,7 +289,7 @@ def profile(
             "--metrics",
             ncu_metric_names,
             "--launch-count",
-            "1",
+            str(pipeline),
             "--cache-control",
             "all",
             "--clock-control",
@@ -333,7 +334,10 @@ def profile(
                 )
             metrics = {}
         else:
-            metrics = parse_ncu_csv(ncu_result.stdout)
+            if pipeline > 1:
+                metrics = parse_ncu_csv_pipeline(ncu_result.stdout, pipeline)
+            else:
+                metrics = parse_ncu_csv(ncu_result.stdout)
 
     metrics["latency_us"] = min_latency_us
 

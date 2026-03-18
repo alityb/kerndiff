@@ -96,6 +96,30 @@ def test_ptx_diff_absent_when_unchanged(v1_result):
     assert render_ptx_diff([]) == ""
 
 
+def test_roofline_omitted_when_both_zero(v1_result, v2_result):
+    deltas = sort_deltas(compute_all_deltas(v1_result.metrics, v2_result.metrics))
+    table = render_metric_table(
+        deltas, v1_result, v2_result,
+        roofline=RooflineResult("memory", 0.0, 0.0, 100.0, True),
+        roofline_v1_bw=0.0,
+        roofline_v1_compute=0.0,
+        use_color=False,
+    )
+    assert "roofline" not in table
+
+
+def test_roofline_shows_bound_transition(v1_result, v2_result):
+    deltas = sort_deltas(compute_all_deltas(v1_result.metrics, v2_result.metrics))
+    table = render_metric_table(
+        deltas, v1_result, v2_result,
+        roofline=RooflineResult("compute", 0.3, 0.8, 20.0, True),
+        roofline_v1_bw=0.7,
+        roofline_v1_compute=0.2,
+        use_color=False,
+    )
+    assert "mem->com" in table
+
+
 def test_roofline_omitted_when_unmatched(v1_result, v2_result):
     deltas = sort_deltas(compute_all_deltas(v1_result.metrics, v2_result.metrics))
     verdict = compute_verdict(v1_result, v2_result)
@@ -117,6 +141,106 @@ def test_roofline_omitted_when_unmatched(v1_result, v2_result):
         warnings=[],
     )
     assert "roofline" not in payload
+
+
+def test_total_hbm_row_in_metric_table(v1_result, v2_result):
+    deltas = sort_deltas(compute_all_deltas(v1_result.metrics, v2_result.metrics))
+    table = render_metric_table(
+        deltas, v1_result, v2_result,
+        use_color=False,
+        total_hbm=(0.123, 0.456),
+    )
+    assert "total_hbm" in table
+    assert "0.123GB" in table
+    assert "0.456GB" in table
+
+
+def test_total_hbm_omitted_when_none(v1_result, v2_result):
+    deltas = sort_deltas(compute_all_deltas(v1_result.metrics, v2_result.metrics))
+    table = render_metric_table(deltas, v1_result, v2_result, use_color=False)
+    assert "total_hbm" not in table
+
+
+def test_json_total_hbm_included(v1_result, v2_result):
+    v1 = v1_result
+    v2 = v2_result
+    deltas = sort_deltas(compute_all_deltas(v1.metrics, v2.metrics))
+    verdict = compute_verdict(v1, v2)
+    payload = build_json_payload(
+        hardware=v1.hardware,
+        kernel_name=v1.kernel_name,
+        file_a="v1.cu",
+        file_b="v2.cu",
+        actual_runs=20,
+        max_runs=50,
+        min_runs=10,
+        noise_threshold=1.0,
+        warmup=32,
+        l2_flush=False,
+        verdict=verdict,
+        deltas=deltas,
+        roofline=RooflineResult("memory", 0.72, 0.89, 11.0, True),
+        ptx_diff=[],
+        warnings=[],
+        total_hbm=(0.5, 0.3),
+        pipeline=3,
+    )
+    assert payload["total_hbm"]["v1_gb"] == 0.5
+    assert payload["total_hbm"]["v2_gb"] == 0.3
+    assert payload["config"]["pipeline"] == 3
+
+
+def test_shape_table_renders():
+    from kerndiff.renderer import render_shape_table
+    rows = [
+        {"shape": 1024, "v1_us": 10.0, "v2_us": 8.0, "speedup": 1.25, "dram_delta": 5.0, "bound": "mem"},
+        {"shape": 2048, "v1_us": 20.0, "v2_us": 15.0, "speedup": 1.33, "dram_delta": -3.0, "bound": "com"},
+    ]
+    table = render_shape_table(rows)
+    assert "1024" in table
+    assert "2048" in table
+    assert "1.25x" in table
+    assert "1.33x" in table
+
+
+def test_verdict_clocks_unlocked_note(v1_result, v2_result):
+    verdict = compute_verdict(v1_result, v2_result)
+    line = render_verdict(verdict, use_color=False, clocks_locked=False)
+    assert "note: clocks not locked" in line
+
+
+def test_verdict_clocks_locked_no_note(v1_result, v2_result):
+    verdict = compute_verdict(v1_result, v2_result)
+    line = render_verdict(verdict, use_color=False, clocks_locked=True)
+    assert "note:" not in line
+
+
+def test_verdict_unchanged_shows_noise_info(v1_result):
+    verdict = compute_verdict(v1_result, v1_result)
+    line = render_verdict(verdict, use_color=False, clocks_locked=False)
+    assert "noise" in line
+
+
+def test_noise_ceiling_question_mark(v1_result, v2_result):
+    """Metrics with small deltas should get ? when noise_ceiling is high."""
+    deltas = sort_deltas(compute_all_deltas(v1_result.metrics, v2_result.metrics))
+    table = render_metric_table(
+        deltas, v1_result, v2_result,
+        use_color=False,
+        noise_ceiling=200.0,  # Very high — everything is uncertain
+    )
+    assert "?" in table
+
+
+def test_no_question_mark_when_locked(v1_result, v2_result):
+    """No ? when noise_ceiling is 0 (clocks locked)."""
+    deltas = sort_deltas(compute_all_deltas(v1_result.metrics, v2_result.metrics))
+    table = render_metric_table(
+        deltas, v1_result, v2_result,
+        use_color=False,
+        noise_ceiling=0.0,
+    )
+    assert "?" not in table
 
 
 def test_startup_hardware_line_in_stderr():

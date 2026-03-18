@@ -20,11 +20,11 @@
 #ifndef BLOCK_SIZE
 #define BLOCK_SIZE 128
 #endif
-#ifndef GRID_SIZE
-#define GRID_SIZE 1024
-#endif
 #ifndef BUF_ELEMS
-#define BUF_ELEMS (1 << 22)
+#define BUF_ELEMS {{BUF_ELEMS}}
+#endif
+#ifndef GRID_SIZE
+#define GRID_SIZE ((BUF_ELEMS + BLOCK_SIZE - 1) / BLOCK_SIZE)
 #endif
 
 static {{ELEM_TYPE}} *d_a = nullptr, *d_b = nullptr, *d_c = nullptr;
@@ -53,17 +53,36 @@ static void flush_l2(size_t l2_size) {
     CHECK(cudaFree(scratch));
 }
 
+static void dump_output(int count) {
+    int n = count < N ? count : N;
+    {{ELEM_TYPE}} *host = ({{ELEM_TYPE}} *)malloc(n * sizeof({{ELEM_TYPE}}));
+    CHECK(cudaMemcpy(host, d_c, n * sizeof({{ELEM_TYPE}}), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < n; i++) {
+        printf("%.6g\n", (double)host[i]);
+    }
+    free(host);
+}
+
 int main(int argc, char** argv) {
     int iters = 1;
     size_t l2_flush_size = 0;
+    int dump_count = 0;
     for (int i = 1; i < argc - 1; i++) {
         if (strcmp(argv[i], "--iters") == 0)
             iters = atoi(argv[i + 1]);
         if (strcmp(argv[i], "--l2-flush") == 0)
             l2_flush_size = (size_t)atoll(argv[i + 1]);
+        if (strcmp(argv[i], "--dump-output") == 0)
+            dump_count = atoi(argv[i + 1]);
     }
 
     setup_buffers();
+
+    if (dump_count > 0) {
+        run_once();
+        dump_output(dump_count);
+        return 0;
+    }
 
     if (iters == 1) {
         if (l2_flush_size > 0)
