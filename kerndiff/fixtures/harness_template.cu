@@ -1,9 +1,6 @@
-// kerndiff benchmark harness
-// {{KERNEL_SOURCE}} -> full .cu file contents
-// {{KERNEL_NAME}}   -> kernel function name (used in default stub only)
-// {{KERNEL_CALL}}   -> full launch expression, e.g. my_kernel<<<G,B>>>(d_a, d_b, d_c, N)
+// kerndiff benchmark harness (auto-generated)
 
-#include <cuda_runtime.h>
+{{DTYPE_INCLUDE}}
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,16 +27,16 @@
 #define BUF_ELEMS (1 << 22)
 #endif
 
-static float *d_a = nullptr, *d_b = nullptr, *d_c = nullptr;
+static {{ELEM_TYPE}} *d_a = nullptr, *d_b = nullptr, *d_c = nullptr;
 static const int N = BUF_ELEMS;
 
 static void setup_buffers() {
     if (d_a) return;
-    CHECK(cudaMalloc(&d_a, BUF_ELEMS * sizeof(float)));
-    CHECK(cudaMalloc(&d_b, BUF_ELEMS * sizeof(float)));
-    CHECK(cudaMalloc(&d_c, BUF_ELEMS * sizeof(float)));
-    CHECK(cudaMemset(d_a, 0, BUF_ELEMS * sizeof(float)));
-    CHECK(cudaMemset(d_b, 0, BUF_ELEMS * sizeof(float)));
+    CHECK(cudaMalloc(&d_a, BUF_ELEMS * sizeof({{ELEM_TYPE}})));
+    CHECK(cudaMalloc(&d_b, BUF_ELEMS * sizeof({{ELEM_TYPE}})));
+    CHECK(cudaMalloc(&d_c, BUF_ELEMS * sizeof({{ELEM_TYPE}})));
+    CHECK(cudaMemset(d_a, 0, BUF_ELEMS * sizeof({{ELEM_TYPE}})));
+    CHECK(cudaMemset(d_b, 0, BUF_ELEMS * sizeof({{ELEM_TYPE}})));
 }
 
 static void run_once() {

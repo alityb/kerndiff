@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import random
+import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean, median, stdev
@@ -29,6 +31,19 @@ MOCK_HARDWARE = HardwareInfo(
     clocks_locked=True,
     mock=True,
 )
+
+GPU_L2_SIZES = {
+    "A10G": 6 * 1024 * 1024,
+    "A10": 6 * 1024 * 1024,
+    "H100": 50 * 1024 * 1024,
+    "H200": 50 * 1024 * 1024,
+    "A100": 40 * 1024 * 1024,
+    "V100": 6 * 1024 * 1024,
+    "L40S": 96 * 1024 * 1024,
+    "L40": 48 * 1024 * 1024,
+    "RTX 4090": 72 * 1024 * 1024,
+    "RTX 3090": 6 * 1024 * 1024,
+}
 
 
 @dataclass
@@ -76,18 +91,47 @@ def query_hardware(gpu_id: int) -> HardwareInfo:
     )
 
 
-def query_l2_size(gpu_id: int) -> int:
+def query_l2_size(gpu_id: int, gpu_name: str = "") -> int:
+    # Try fuzzy match against known GPU L2 sizes first
+    for name, size in GPU_L2_SIZES.items():
+        if name.lower() in gpu_name.lower():
+            return size
+    # Fall back to nvidia-smi
     result = subprocess.run(
         ["nvidia-smi", "--query-gpu=l2_cache", "--format=csv,noheader,nounits", "-i", str(gpu_id)],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0 or not result.stdout.strip():
-        return 40 * 1024 * 1024  # 40MB fallback (H100)
+        return 6 * 1024 * 1024  # 6MB safe fallback
     try:
         return int(result.stdout.strip()) * 1024
     except ValueError:
-        return 40 * 1024 * 1024
+        return 6 * 1024 * 1024
+
+
+def _find_ncu() -> str | None:
+    ncu = shutil.which("ncu")
+    if ncu:
+        return ncu
+    # Check common installation paths
+    search_dirs = [
+        "/opt/nvidia/nsight-compute",
+        "/usr/local/cuda/bin",
+        "/usr/local/cuda/nsight-compute",
+    ]
+    for base in search_dirs:
+        if not os.path.isdir(base):
+            continue
+        # Find the latest version
+        for entry in sorted(os.listdir(base), reverse=True):
+            candidate = os.path.join(base, entry, "ncu")
+            if os.path.isfile(candidate):
+                return candidate
+        candidate = os.path.join(base, "ncu")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def lock_clocks(gpu_id: int) -> bool:
@@ -156,27 +200,53 @@ def profile(
     if env:
         run_env.update(env)
 
-    l2_size_bytes = query_l2_size(gpu_id)
+    l2_size_bytes = query_l2_size(gpu_id, gpu_name=hardware.gpu_name)
 
     # Warmup — no L2 flush
-    subprocess.run(
-        [binary, "--kernel", kernel_name, "--iters", str(warmup)],
-        check=True,
-        env=run_env,
-    )
+    try:
+        subprocess.run(
+            [binary, "--kernel", kernel_name, "--iters", str(warmup)],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=run_env,
+        )
+    except subprocess.CalledProcessError as e:
+        stderr_text = (e.stderr or "").strip()
+        raise SystemExit(
+            f"error: kernel crashed during warmup (exit code {e.returncode})\n\n"
+            f"  binary: {binary}\n"
+            f"  stderr: {stderr_text}\n\n"
+            f"  this usually means:\n"
+            f"  - buffer size is too small for the kernel's access pattern\n"
+            f"  - the kernel requires a specific launch config (use --call)\n"
+            f"  - the kernel has a bug"
+        )
 
     # Adaptive timed runs with L2 flush
     latencies: list[float] = []
     cv_pct = float("inf")
 
     while len(latencies) < min_runs or (cv_pct > noise_threshold and len(latencies) < max_runs):
-        r = subprocess.run(
-            [binary, "--kernel", kernel_name, "--iters", "1", "--l2-flush", str(l2_size_bytes)],
-            capture_output=True,
-            text=True,
-            check=True,
-            env=run_env,
-        )
+        try:
+            r = subprocess.run(
+                [binary, "--kernel", kernel_name, "--iters", "1", "--l2-flush", str(l2_size_bytes)],
+                capture_output=True,
+                text=True,
+                check=True,
+                env=run_env,
+            )
+        except subprocess.CalledProcessError as e:
+            stderr_text = (e.stderr or "").strip()
+            raise SystemExit(
+                f"error: kernel crashed during timing run (exit code {e.returncode})\n\n"
+                f"  binary: {binary}\n"
+                f"  stderr: {stderr_text}\n\n"
+                f"  this usually means:\n"
+                f"  - buffer size is too small for the kernel's access pattern\n"
+                f"  - the kernel requires a specific launch config (use --call)\n"
+                f"  - the kernel has a bug"
+            )
         latencies.append(float(r.stdout.strip()))
         if len(latencies) >= 2:
             cv_pct = _compute_cv(latencies)
@@ -202,17 +272,25 @@ def profile(
             f"high variance detected (min={min_latency_us:.1f}us, max={max(latencies):.1f}us). Clock locking recommended."
         )
 
-    ncu_metric_names = ",".join(METRICS_BY_NCU.keys())
-    ncu_result = subprocess.run(
-        [
-            "ncu",
+    # NCU hardware counter collection
+    ncu_path = _find_ncu()
+    if ncu_path is None:
+        warnings.append(
+            "NCU (nsight-compute) not found. Install with: sudo apt-get install nsight-compute-2026.1.0\n"
+            "  continuing with latency-only diff (no hardware counters)."
+        )
+        metrics: dict[str, float] = {}
+    else:
+        ncu_metric_names = ",".join(METRICS_BY_NCU.keys())
+        ncu_cmd = [
+            ncu_path,
             "--csv",
             "--metrics",
             ncu_metric_names,
             "--launch-count",
             "1",
             "--cache-control",
-            "flush_all",
+            "all",
             "--clock-control",
             "base",
             binary,
@@ -220,20 +298,42 @@ def profile(
             kernel_name,
             "--iters",
             "1",
-        ],
-        capture_output=True,
-        text=True,
-        env=run_env,
-    )
+        ]
 
-    if not ncu_result.stdout.strip():
-        warnings.append(
-            "NCU returned no output. Check permissions or try: "
-            "sudo ncu ... or set /proc/sys/kernel/perf_event_paranoid to 0"
-        )
-        metrics = {}
-    else:
-        metrics = parse_ncu_csv(ncu_result.stdout)
+        ncu_result = subprocess.run(ncu_cmd, capture_output=True, text=True, env=run_env)
+
+        # NCU puts some errors in stdout, some in stderr
+        ncu_all_output = ((ncu_result.stdout or "") + (ncu_result.stderr or "")).lower()
+
+        # If permission denied, retry with sudo
+        if ncu_result.returncode != 0 or "err_nvgpuctrperm" in ncu_all_output or ("permission" in ncu_all_output and "\"Metric Name\"" not in (ncu_result.stdout or "")):
+            sudo = shutil.which("sudo")
+            if sudo:
+                print("  ncu: retrying with sudo...", file=sys.stderr)
+                ncu_result = subprocess.run(
+                    [sudo] + ncu_cmd, capture_output=True, text=True, env=run_env,
+                )
+
+        ncu_has_csv = "\"Metric Name\"" in (ncu_result.stdout or "")
+        if not ncu_has_csv:
+            ncu_all_text = ((ncu_result.stdout or "") + (ncu_result.stderr or "")).lower()
+            if "permission" in ncu_all_text or "perf_event_paranoid" in ncu_all_text or "err_nvgpuctrperm" in ncu_all_text:
+                warnings.append(
+                    "NCU requires elevated permissions on this system.\n"
+                    "  fix: sudo sh -c 'echo 0 > /proc/sys/kernel/perf_event_paranoid'\n"
+                    "  or:  sudo ncu ... (run kerndiff with sudo)\n"
+                    "  continuing with latency-only diff (no hardware counters)."
+                )
+            else:
+                err_text = (ncu_result.stderr or ncu_result.stdout or "(empty)").strip()[:200]
+                warnings.append(
+                    f"NCU returned no usable output.\n"
+                    f"  {err_text}\n"
+                    "  continuing with latency-only diff (no hardware counters)."
+                )
+            metrics = {}
+        else:
+            metrics = parse_ncu_csv(ncu_result.stdout)
 
     metrics["latency_us"] = min_latency_us
 

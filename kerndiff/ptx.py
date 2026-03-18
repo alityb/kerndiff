@@ -5,6 +5,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from kerndiff.compiler import _find_nvcc, _find_cuda_lib_dir
+
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 
@@ -28,10 +30,16 @@ def parse_ptx_instructions(ptx_text: str) -> dict[str, int]:
 
 
 def extract_ptx(source_path: str, arch: str = "sm_90") -> dict[str, int]:
+    nvcc = _find_nvcc()
     with tempfile.TemporaryDirectory(prefix="kerndiff_ptx_") as tmpdir:
         out_path = Path(tmpdir) / "kernel.ptx"
+        cmd = [nvcc, "-ptx", f"-arch={arch}"]
+        lib_dir = _find_cuda_lib_dir(nvcc)
+        if lib_dir:
+            cmd.append(f"-L{lib_dir}")
+        cmd.extend(["-o", str(out_path), source_path])
         result = subprocess.run(
-            ["nvcc", "-ptx", f"-arch={arch}", "-o", str(out_path), source_path],
+            cmd,
             capture_output=True,
             text=True,
         )

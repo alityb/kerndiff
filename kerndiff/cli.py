@@ -80,6 +80,19 @@ def resolve_kernel_name(file_a: str, file_b: str, fn_name: str | None) -> str:
     raise SystemExit("\n".join(msg))
 
 
+def resolve_all_kernels(file_a: str, file_b: str) -> list[str]:
+    kernels_a = set(_scan_kernels(file_a))
+    kernels_b = set(_scan_kernels(file_b))
+    common = sorted(kernels_a & kernels_b)
+    for name in sorted(kernels_a - kernels_b):
+        print(f"  skipping {name} (not in {os.path.basename(file_b)})", file=sys.stderr)
+    for name in sorted(kernels_b - kernels_a):
+        print(f"  skipping {name} (not in {os.path.basename(file_a)})", file=sys.stderr)
+    if not common:
+        raise SystemExit("error: no common kernels found between the two files")
+    return common
+
+
 def _status_line(label: str, status: str, suffix: str = "") -> str:
     return f"  {label:<34}{status:>8}{('  ' + suffix) if suffix else ''}"
 
@@ -113,8 +126,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kerndiff", add_help=True)
     parser.add_argument("files", nargs="+", help=".cu file(s)")
     parser.add_argument("--fn", dest="fn_name")
+    parser.add_argument("--all", dest="all_kernels", action="store_true",
+                        help="profile all common kernels in both files")
     parser.add_argument("--call", dest="call_expr", default=None,
                         help="kernel launch expression (for non-standard signatures)")
+    parser.add_argument("--dtype", choices=["float", "half", "int", "int4"], default="float",
+                        help="element type for harness buffers (default: float)")
     parser.add_argument("--max-runs", type=int, default=50)
     parser.add_argument("--min-runs", type=int, default=10)
     parser.add_argument("--noise-threshold", type=float, default=1.0)
@@ -128,135 +145,58 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-    if len(args.files) not in {1, 2}:
-        parser.error("expected one or two .cu files")
-    file_a = args.files[0]
-    file_b = args.files[1] if len(args.files) == 2 else None
-    use_color = not args.no_color and args.format == "term" and sys.stdout.isatty()
-    aggregate_warnings: list[str] = []
-
-    # --- GPU / CUDA_VISIBLE_DEVICES resolution ---
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if args.mock:
-        hardware = MOCK_HARDWARE
-        print(f"  gpu: {hardware.gpu_name} (mock)", file=sys.stderr)
-        _warn("mock mode -- no GPU required.", aggregate_warnings)
-        physical_gpu_id = args.gpu
-        binary_env: dict | None = None
-    else:
-        if cuda_visible is not None:
-            # Env var already set by scheduler or user — respect it.
-            if args.gpu != 0:
-                _warn(
-                    f"CUDA_VISIBLE_DEVICES={cuda_visible} is set; --gpu {args.gpu} ignored.",
-                    aggregate_warnings,
-                )
-            try:
-                physical_gpu_id = int(cuda_visible.split(",")[0])
-            except (ValueError, IndexError):
-                physical_gpu_id = 0
-            binary_env = None  # already in env
-        else:
-            physical_gpu_id = args.gpu
-            binary_env = {"CUDA_VISIBLE_DEVICES": str(args.gpu)}
-
-        hardware = query_hardware(gpu_id=physical_gpu_id)
-        if args.arch == "sm_90":
-            detected_arch = detect_sm_arch(hardware.gpu_name)
-            if detected_arch:
-                args.arch = detected_arch
-        state = "clocks locked" if hardware.clocks_locked else "clocks unlocked"
-        print(f"  gpu: {hardware.gpu_name} (device {physical_gpu_id}, {args.arch}, {state})", file=sys.stderr)
-
-    # --- File resolution ---
-    if file_b is None:
-        if args.mock:
-            file_b = file_a
-            file_a = "fixtures/v1_ncu.csv"
-        else:
-            file_a, file_b = _prepare_git_mode(file_a)
-
-    if not args.mock:
-        for path in (file_a, file_b):
-            if not Path(path).exists():
-                raise SystemExit(f"error: file not found: {path}")
-
-    kernel_name = args.fn_name
-    if kernel_name is None and Path(file_a).exists() and Path(file_b).exists():
-        kernel_name = resolve_kernel_name(file_a, file_b, None)
-    elif kernel_name is None:
-        raise SystemExit("error: could not auto-detect kernel — please specify --fn")
-
+def _run_single_kernel(
+    args,
+    kernel_name: str,
+    file_a: str,
+    file_b: str,
+    hardware,
+    physical_gpu_id: int,
+    binary_env: dict | None,
+    noise_floor: float,
+    aggregate_warnings: list[str],
+    use_color: bool,
+) -> str:
     # --- Compilation ---
-    _emit_status("compiling...", "ok", f"{0.0:.1f}s" if args.mock else "")
+    _emit_status(f"compiling {kernel_name}...", "ok")
     if not args.mock:
-        compile_start = time.perf_counter()
-        binary_a = compile_kernel(file_a, kernel_name, arch=args.arch, mock=False, kernel_call=args.call_expr)
-        binary_b = compile_kernel(file_b, kernel_name, arch=args.arch, mock=False, kernel_call=args.call_expr)
-        _emit_status("compiling...", "ok", f"{time.perf_counter() - compile_start:.1f}s")
+        binary_a = compile_kernel(file_a, kernel_name, arch=args.arch, mock=False, kernel_call=args.call_expr, dtype=args.dtype)
+        binary_b = compile_kernel(file_b, kernel_name, arch=args.arch, mock=False, kernel_call=args.call_expr, dtype=args.dtype)
     else:
         binary_a = file_a
         binary_b = file_b
 
-    # --- Clock locking ---
-    noise_floor = NOISE_FLOOR_LOCKED
-    if args.mock:
-        hardware.clocks_locked = True
-    else:
-        locked = False
-        try:
-            locked = lock_clocks(physical_gpu_id)
-        except FileNotFoundError:
-            locked = False
-        hardware.clocks_locked = locked
-        if locked:
-            _emit_status("locking clocks...", "ok")
-        else:
-            noise_floor = NOISE_FLOOR_UNLOCKED
-            _emit_status("locking clocks...", "skipped", "-- results may vary +/-10%")
-            _warn("clock locking unavailable (requires sudo). Results may vary +/-10%.", aggregate_warnings)
-
     # --- Profiling ---
-    try:
-        _emit_status(f"warming up ({args.warmup} iters)...", "ok")
+    result_a = profile(
+        binary_a, kernel_name,
+        max_runs=args.max_runs, min_runs=args.min_runs,
+        noise_threshold=args.noise_threshold, warmup=args.warmup,
+        gpu_id=physical_gpu_id, hardware=hardware,
+        mock=args.mock, mock_prefix="v1", env=binary_env,
+    )
+    _emit_status(
+        f"profiling v1 {kernel_name}...",
+        "ok",
+        f"{result_a.actual_runs} runs  {result_a.min_latency_us:.0f}us  cv={result_a.cv_pct:.1f}%",
+    )
 
-        result_a = profile(
-            binary_a, kernel_name,
-            max_runs=args.max_runs, min_runs=args.min_runs,
-            noise_threshold=args.noise_threshold, warmup=args.warmup,
-            gpu_id=physical_gpu_id, hardware=hardware,
-            mock=args.mock, mock_prefix="v1", env=binary_env,
-        )
-        _emit_status(
-            "profiling v1 (cold, adaptive)...",
-            "ok",
-            f"{result_a.actual_runs} runs  {result_a.min_latency_us:.0f}us  cv={result_a.cv_pct:.1f}%",
-        )
-
-        result_b = profile(
-            binary_b, kernel_name,
-            max_runs=args.max_runs, min_runs=args.min_runs,
-            noise_threshold=args.noise_threshold, warmup=args.warmup,
-            gpu_id=physical_gpu_id, hardware=hardware,
-            mock=args.mock, mock_prefix="v2", env=binary_env,
-        )
-        _emit_status(
-            "profiling v2 (cold, adaptive)...",
-            "ok",
-            f"{result_b.actual_runs} runs  {result_b.min_latency_us:.0f}us  cv={result_b.cv_pct:.1f}%",
-        )
-    finally:
-        if not args.mock:
-            unlock_clocks(physical_gpu_id)
+    result_b = profile(
+        binary_b, kernel_name,
+        max_runs=args.max_runs, min_runs=args.min_runs,
+        noise_threshold=args.noise_threshold, warmup=args.warmup,
+        gpu_id=physical_gpu_id, hardware=hardware,
+        mock=args.mock, mock_prefix="v2", env=binary_env,
+    )
+    _emit_status(
+        f"profiling v2 {kernel_name}...",
+        "ok",
+        f"{result_b.actual_runs} runs  {result_b.min_latency_us:.0f}us  cv={result_b.cv_pct:.1f}%",
+    )
 
     for warning in result_a.warnings + result_b.warnings:
         _warn(warning, aggregate_warnings)
 
     # --- PTX ---
-    _emit_status("extracting ptx...", "ok")
     if args.mock:
         ptx_a = ptx.load_fixture("v1")
         ptx_b = ptx.load_fixture("v2")
@@ -299,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             ptx_diff=ptx_diff,
             warnings=aggregate_warnings,
         )
-        output = render_json(payload)
+        return render_json(payload)
     else:
         sections = [
             render_verdict(verdict, use_color=use_color),
@@ -316,12 +256,123 @@ def main(argv: list[str] | None = None) -> int:
         ptx_section = render_ptx_diff(ptx_diff)
         if ptx_section:
             sections.append(ptx_section)
-        output = "\n".join(sections)
+        return "\n".join(sections)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if args.fn_name and args.all_kernels:
+        raise SystemExit("error: --fn and --all are mutually exclusive")
+
+    if len(args.files) not in {1, 2}:
+        parser.error("expected one or two .cu files")
+    file_a = args.files[0]
+    file_b = args.files[1] if len(args.files) == 2 else None
+    use_color = not args.no_color and args.format == "term" and sys.stdout.isatty()
+    aggregate_warnings: list[str] = []
+
+    # --- GPU / CUDA_VISIBLE_DEVICES resolution ---
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if args.mock:
+        hardware = MOCK_HARDWARE
+        print(f"  gpu: {hardware.gpu_name} (mock)", file=sys.stderr)
+        _warn("mock mode -- no GPU required.", aggregate_warnings)
+        physical_gpu_id = args.gpu
+        binary_env: dict | None = None
+    else:
+        if cuda_visible is not None:
+            if args.gpu != 0:
+                _warn(
+                    f"CUDA_VISIBLE_DEVICES={cuda_visible} is set; --gpu {args.gpu} ignored.",
+                    aggregate_warnings,
+                )
+            try:
+                physical_gpu_id = int(cuda_visible.split(",")[0])
+            except (ValueError, IndexError):
+                physical_gpu_id = 0
+            binary_env = None
+        else:
+            physical_gpu_id = args.gpu
+            binary_env = {"CUDA_VISIBLE_DEVICES": str(args.gpu)}
+
+        hardware = query_hardware(gpu_id=physical_gpu_id)
+        if args.arch == "sm_90":
+            detected_arch = detect_sm_arch(hardware.gpu_name)
+            if detected_arch:
+                args.arch = detected_arch
+        state = "clocks locked" if hardware.clocks_locked else "clocks unlocked"
+        print(f"  gpu: {hardware.gpu_name} (device {physical_gpu_id}, {args.arch}, {state})", file=sys.stderr)
+
+    # --- File resolution ---
+    if file_b is None:
+        if args.mock:
+            file_b = file_a
+            file_a = "fixtures/v1_ncu.csv"
+        else:
+            file_a, file_b = _prepare_git_mode(file_a)
+
+    if not args.mock:
+        for path in (file_a, file_b):
+            if not Path(path).exists():
+                raise SystemExit(f"error: file not found: {path}")
+
+    # --- Resolve kernel name(s) ---
+    if args.all_kernels:
+        if not Path(file_a).exists() or not Path(file_b).exists():
+            raise SystemExit("error: --all requires both files to exist on disk")
+        kernel_names = resolve_all_kernels(file_a, file_b)
+    else:
+        kernel_name = args.fn_name
+        if kernel_name is None and Path(file_a).exists() and Path(file_b).exists():
+            kernel_name = resolve_kernel_name(file_a, file_b, None)
+        elif kernel_name is None:
+            raise SystemExit("error: could not auto-detect kernel — please specify --fn")
+        kernel_names = [kernel_name]
+
+    # --- Clock locking ---
+    noise_floor = NOISE_FLOOR_LOCKED
+    if args.mock:
+        hardware.clocks_locked = True
+    else:
+        locked = False
+        try:
+            locked = lock_clocks(physical_gpu_id)
+        except FileNotFoundError:
+            locked = False
+        hardware.clocks_locked = locked
+        if locked:
+            _emit_status("locking clocks...", "ok")
+        else:
+            noise_floor = NOISE_FLOOR_UNLOCKED
+            _emit_status("locking clocks...", "skipped", "-- results may vary +/-10%")
+            _warn("clock locking unavailable (requires sudo). Results may vary +/-10%.", aggregate_warnings)
+
+    # --- Profile each kernel ---
+    try:
+        outputs = []
+        for kname in kernel_names:
+            if len(kernel_names) > 1:
+                print(f"\n=== {kname} ===", file=sys.stderr)
+            output = _run_single_kernel(
+                args, kname, file_a, file_b,
+                hardware, physical_gpu_id, binary_env,
+                noise_floor, aggregate_warnings, use_color,
+            )
+            if len(kernel_names) > 1:
+                outputs.append(f"\n=== {kname} ===\n{output}")
+            else:
+                outputs.append(output)
+        final_output = "\n".join(outputs)
+    finally:
+        if not args.mock:
+            unlock_clocks(physical_gpu_id)
 
     if args.output:
-        write_output(output, args.output)
+        write_output(final_output, args.output)
     else:
-        print(output)
+        print(final_output)
     return 0
 
 
