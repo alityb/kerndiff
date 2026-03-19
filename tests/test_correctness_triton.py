@@ -168,3 +168,39 @@ def test_profile_result_output_vals_set():
         output_vals=[1.0, 2.0, 3.0],
     )
     assert r.output_vals == [1.0, 2.0, 3.0]
+
+
+def test_mixed_cuda_triton_correctness_uses_binary_dump_fallback(monkeypatch):
+    from types import SimpleNamespace
+    from kerndiff import cli
+
+    class _PersistentBackend:
+        def is_persistent(self):
+            return True
+
+    dump_calls = {"count": 0}
+
+    def _fake_dump(binary, env, dump_count=16):
+        dump_calls["count"] += 1
+        return [1.0, 2.0, 3.0]
+
+    monkeypatch.setattr(cli, "_dump_output_from_binary", _fake_dump)
+
+    args = SimpleNamespace(tol=1e-4)
+    result_a = SimpleNamespace(output_vals=[])
+    result_b = SimpleNamespace(output_vals=[1.0, 2.0, 3.0])
+    warnings = []
+
+    cli._run_correctness_check(
+        args=args,
+        binary_a="/tmp/cuda_bin",
+        binary_b="/tmp/triton_harness.py",
+        backend_a=None,
+        binary_env=None,
+        result_a=result_a,
+        result_b=result_b,
+        aggregate_warnings=warnings,
+        backend_b=_PersistentBackend(),
+    )
+    assert dump_calls["count"] == 1
+    assert warnings == []

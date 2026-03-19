@@ -26,6 +26,7 @@ from kerndiff.roofline import compute_roofline
 KERNEL_RE = re.compile(r"__global__\s+\w+\s+(\w+)\s*\(")
 TRITON_KERNEL_RE = re.compile(r"@triton\.jit\s+def\s+(\w+)")
 _TEMP_PATHS: list[str] = []
+_SUPPRESS_STDERR = False
 
 
 def _cleanup_temp_paths() -> None:
@@ -114,13 +115,20 @@ def resolve_kernel_name(file_a: str, file_b: str, fn_name: str | None) -> str:
 def resolve_all_kernels(file_a: str, file_b: str) -> list[str]:
     kernels_a = set(_scan_kernels(file_a))
     kernels_b = set(_scan_kernels(file_b))
+    if not kernels_a:
+        raise SystemExit(f"error: no kernels found in {os.path.basename(file_a)}")
+    if not kernels_b:
+        raise SystemExit(f"error: no kernels found in {os.path.basename(file_b)}")
     common = sorted(kernels_a & kernels_b)
-    for name in sorted(kernels_a - kernels_b):
-        print(f"  skipping {name} (not in {os.path.basename(file_b)})", file=sys.stderr)
-    for name in sorted(kernels_b - kernels_a):
-        print(f"  skipping {name} (not in {os.path.basename(file_a)})", file=sys.stderr)
+    if not _SUPPRESS_STDERR:
+        for name in sorted(kernels_a - kernels_b):
+            print(f"  skipping {name} (not in {os.path.basename(file_b)})", file=sys.stderr)
+        for name in sorted(kernels_b - kernels_a):
+            print(f"  skipping {name} (not in {os.path.basename(file_a)})", file=sys.stderr)
     if not common:
-        raise SystemExit("error: no common kernels found between the two files")
+        raise SystemExit(
+            f"error: no kernels in common between {os.path.basename(file_a)} and {os.path.basename(file_b)}"
+        )
     return common
 
 
@@ -129,11 +137,15 @@ def _status_line(label: str, status: str, suffix: str = "") -> str:
 
 
 def _emit_status(label: str, status: str, suffix: str = "") -> None:
+    if _SUPPRESS_STDERR:
+        return
     print(_status_line(label, status, suffix), file=sys.stderr)
 
 
 def _warn(msg: str, warnings: list[str]) -> None:
     warnings.append(msg)
+    if _SUPPRESS_STDERR:
+        return
     print(f"warning: {msg}", file=sys.stderr)
 
 
@@ -261,6 +273,29 @@ def _emit_correctness_result(
         _emit_status(f"{label}...", "ok", f"max_diff={max_diff:.1e}")
 
 
+def _dump_output_from_binary(binary: str, env: dict | None, dump_count: int = 16) -> list[float]:
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+    try:
+        result = subprocess.run(
+            [binary, "--dump-output", str(dump_count)],
+            capture_output=True,
+            text=True,
+            env=run_env,
+        )
+    except Exception:
+        return []
+
+    values: list[float] = []
+    for line in (result.stdout or "").splitlines():
+        try:
+            values.append(float(line.strip()))
+        except ValueError:
+            continue
+    return values
+
+
 def _run_correctness_check(
     args,
     binary_a: str,
@@ -276,9 +311,16 @@ def _run_correctness_check(
     def _is_persistent(b):
         return b is not None and hasattr(b, "is_persistent") and b.is_persistent()
 
-    if _is_persistent(backend_a) or _is_persistent(backend_b):
+    persistent_a = _is_persistent(backend_a)
+    persistent_b = _is_persistent(backend_b)
+
+    if persistent_a or persistent_b:
         v1_vals = result_a.output_vals
         v2_vals = result_b.output_vals
+        if not v1_vals and not persistent_a:
+            v1_vals = _dump_output_from_binary(binary_a, binary_env)
+        if not v2_vals and not persistent_b:
+            v2_vals = _dump_output_from_binary(binary_b, binary_env)
         if not v1_vals or not v2_vals:
             _emit_status("correctness check...", "skipped", "(dump returned no values)")
             return
@@ -562,7 +604,8 @@ def _run_shape_sweep(
     rows = []
     pipeline = getattr(args, "pipeline", 1)
     for shape in shapes:
-        print(f"\n  --- shape={shape} ---", file=sys.stderr)
+        if not _SUPPRESS_STDERR:
+            print(f"\n  --- shape={shape} ---", file=sys.stderr)
         if not args.mock:
             binary_a = compile_kernel(file_a, kernel_name, arch=args.arch, mock=False, kernel_call=args.call_expr, dtype=args.dtype, buf_elems=shape)
             binary_b = compile_kernel(file_b, kernel_name, arch=args.arch, mock=False, kernel_call=args.call_expr, dtype=args.dtype, buf_elems=shape)
@@ -612,61 +655,66 @@ def _run_shape_sweep(
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _SUPPRESS_STDERR
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    prev_suppress = _SUPPRESS_STDERR
+    _SUPPRESS_STDERR = args.format == "json"
+    try:
+        # --- Config file ---
+        config_path = find_config()
+        config = {}
+        if config_path:
+            config = load_config(config_path)
+            if config and not _SUPPRESS_STDERR:
+                print(f"  config: {config_path}", file=sys.stderr)
 
-    # --- Config file ---
-    config_path = find_config()
-    config = {}
-    if config_path:
-        config = load_config(config_path)
+        # Apply config defaults (before kernel-specific, which needs fn resolution)
         if config:
-            print(f"  config: {config_path}", file=sys.stderr)
+            args = apply_config(args, config)
 
-    # Apply config defaults (before kernel-specific, which needs fn resolution)
-    if config:
-        args = apply_config(args, config)
+        # --- Validation ---
+        if args.fn_name and args.all_kernels:
+            raise SystemExit("error: --fn and --all are mutually exclusive")
 
-    # --- Validation ---
-    if args.fn_name and args.all_kernels:
-        raise SystemExit("error: --fn and --all are mutually exclusive")
+        if args.pipeline > 1 and not args.call_expr:
+            raise SystemExit("error: --pipeline requires --call")
 
-    if args.pipeline > 1 and not args.call_expr:
-        raise SystemExit("error: --pipeline requires --call")
+        if len(args.files) not in {1, 2}:
+            parser.error("expected one or two .cu or .py files")
 
-    if len(args.files) not in {1, 2}:
-        parser.error("expected one or two .cu or .py files")
+        if args.elems <= 0:
+            raise SystemExit("error: --elems must be > 0")
 
-    if args.elems <= 0:
-        raise SystemExit("error: --elems must be > 0")
+        if args.min_runs > args.max_runs:
+            raise SystemExit(f"error: --min-runs ({args.min_runs}) cannot exceed --max-runs ({args.max_runs})")
 
-    if args.min_runs > args.max_runs:
-        raise SystemExit(f"error: --min-runs ({args.min_runs}) cannot exceed --max-runs ({args.max_runs})")
+        file_a = args.files[0]
+        file_b = args.files[1] if len(args.files) == 2 else None
 
-    file_a = args.files[0]
-    file_b = args.files[1] if len(args.files) == 2 else None
+        if args.at_ref is not None and file_b is not None:
+            raise SystemExit("error: --at only applies to single-file (git) mode")
 
-    if args.at_ref is not None and file_b is not None:
-        raise SystemExit("error: --at only applies to single-file (git) mode")
+        use_color = not args.no_color and args.format == "term" and sys.stdout.isatty()
+        aggregate_warnings: list[str] = []
 
-    use_color = not args.no_color and args.format == "term" and sys.stdout.isatty()
-    aggregate_warnings: list[str] = []
+        # --- Parse shape list ---
+        shapes: list[int] | None = None
+        if args.shape:
+            try:
+                shapes = [int(s.strip()) for s in args.shape.split(",")]
+            except ValueError:
+                raise SystemExit("error: --shape values must be positive integers (e.g. 1024,2048,4096)")
+            if any(s <= 0 for s in shapes):
+                raise SystemExit("error: --shape values must be > 0")
 
-    # --- Parse shape list ---
-    shapes: list[int] | None = None
-    if args.shape:
-        try:
-            shapes = [int(s.strip()) for s in args.shape.split(",")]
-        except ValueError:
-            raise SystemExit("error: --shape values must be positive integers (e.g. 1024,2048,4096)")
-        if any(s <= 0 for s in shapes):
-            raise SystemExit("error: --shape values must be > 0")
+        # --- Watch mode wraps everything ---
+        if args.watch:
+            return _watch_loop(args, argv)
 
-    # --- Watch mode wraps everything ---
-    if args.watch:
-        return _watch_loop(args, argv)
-
-    return _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, config)
+        return _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, config)
+    finally:
+        _SUPPRESS_STDERR = prev_suppress
 
 
 def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, config=None):
@@ -674,7 +722,8 @@ def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, confi
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if args.mock:
         hardware = MOCK_HARDWARE
-        print(f"  gpu: {hardware.gpu_name} (mock)", file=sys.stderr)
+        if not _SUPPRESS_STDERR:
+            print(f"  gpu: {hardware.gpu_name} (mock)", file=sys.stderr)
         _warn("mock mode -- no GPU required.", aggregate_warnings)
         physical_gpu_id = args.gpu
         binary_env: dict | None = None
@@ -700,7 +749,8 @@ def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, confi
             if detected_arch:
                 args.arch = detected_arch
         state = "clocks locked" if hardware.clocks_locked else "clocks unlocked"
-        print(f"  gpu: {hardware.gpu_name} (device {physical_gpu_id}, {args.arch}, {state})", file=sys.stderr)
+        if not _SUPPRESS_STDERR:
+            print(f"  gpu: {hardware.gpu_name} (device {physical_gpu_id}, {args.arch}, {state})", file=sys.stderr)
 
     # --- NVML peak bandwidth ---
     nvml_peak_bw = None
@@ -719,7 +769,8 @@ def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, confi
             file_b = args.files[0]
 
     if git_display_label:
-        print(f"  comparing: {git_display_label}  vs  {args.files[0]} (working copy)", file=sys.stderr)
+        if not _SUPPRESS_STDERR:
+            print(f"  comparing: {git_display_label}  vs  {args.files[0]} (working copy)", file=sys.stderr)
 
     if not args.mock:
         for path in (file_a, file_b):

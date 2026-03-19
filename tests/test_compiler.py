@@ -1,4 +1,11 @@
-from kerndiff.compiler import _format_compile_error, DTYPE_MAP, verify_correctness, parse_kernel_signature, generate_call
+from kerndiff.compiler import (
+    _format_compile_error,
+    DTYPE_MAP,
+    build_harness,
+    generate_call,
+    parse_kernel_signature,
+    verify_correctness,
+)
 
 
 def test_format_compile_error_shows_source_name():
@@ -120,3 +127,19 @@ def test_verify_correctness_detects_mismatch(tmp_path):
     script_b.chmod(0o755)
     max_diff, v1_vals, v2_vals = verify_correctness(str(script_a), str(script_b))
     assert max_diff == 1.0
+
+
+def test_build_harness_does_not_replace_placeholders_inside_kernel_source(tmp_path):
+    src = tmp_path / "k.cu"
+    src.write_text(
+        "__global__ void my_kernel(float* a, float* b, float* c, int n) {\n"
+        "  // literal placeholder {{KERNEL_NAME}} should stay unchanged in source\n"
+        "}\n"
+    )
+    harness_path = build_harness(
+        str(src),
+        "my_kernel",
+        "my_kernel<<<GRID_SIZE, BLOCK_SIZE>>>(d_a, d_b, d_c, N)",
+    )
+    content = open(harness_path).read()
+    assert "// literal placeholder {{KERNEL_NAME}}" in content

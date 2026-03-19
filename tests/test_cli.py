@@ -91,6 +91,26 @@ def test_all_flag_skips_non_common_kernels(tmp_path):
     assert "latency" in stdout.getvalue()
 
 
+def test_all_flag_errors_when_no_kernels_in_v1(tmp_path):
+    file_a = tmp_path / "v1.cu"
+    file_b = tmp_path / "v2.cu"
+    file_a.write_text("// no kernels here\n")
+    file_b.write_text(SINGLE_KERNEL)
+    with pytest.raises(SystemExit) as exc:
+        main(["--mock", str(file_a), str(file_b), "--all"])
+    assert f"no kernels found in {file_a.name}" in str(exc.value)
+
+
+def test_all_flag_errors_when_no_common_kernels(tmp_path):
+    file_a = tmp_path / "v1.cu"
+    file_b = tmp_path / "v2.cu"
+    file_a.write_text("__global__ void only_a(float* a, float* b, float* c, int n) {}\n")
+    file_b.write_text("__global__ void only_b(float* a, float* b, float* c, int n) {}\n")
+    with pytest.raises(SystemExit) as exc:
+        main(["--mock", str(file_a), str(file_b), "--all"])
+    assert f"no kernels in common between {file_a.name} and {file_b.name}" in str(exc.value)
+
+
 def test_dtype_flag_accepted():
     stdout = io.StringIO()
     stderr = io.StringIO()
@@ -309,3 +329,18 @@ def test_multi_kernel_non_tty_errors(tmp_path):
     with pytest.raises(SystemExit) as exc:
         main(["--mock", str(file_a), str(file_b)])
     assert "could not auto-detect kernel" in str(exc.value)
+
+
+def test_mock_cli_numeric_display_formats():
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        rc = main(["--mock", "v1.cu", "v2.cu", "--fn", "k", "--no-color"])
+    assert rc == 0
+    out = stdout.getvalue() + stderr.getvalue()
+    assert "\033[" not in out
+    assert "-23.5%" in out          # latency (% delta)
+    assert "+26.2pp" in out         # l2_hit_rate (pp)
+    assert "+139.9%" in out         # l1_bank_conflicts (% delta)
+    assert "+8" in out              # register_count (raw int diff)
+    assert "+16" in out             # shared_mem (KB diff)

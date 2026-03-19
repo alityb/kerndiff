@@ -48,6 +48,9 @@ def format_delta(delta: MetricDelta) -> str:
         return f"{delta.delta_pct:+.1f}%"
     # unit == "int" or "B": show raw integer diff
     raw_diff = delta.v2 - delta.v1
+    if metric.key == "shared_mem_kb":
+        # NCU reports shared memory in bytes; table displays KB, so delta should align.
+        raw_diff /= 1024.0
     if metric.unit == "B":
         value = fmt_kb(abs(raw_diff))
     else:

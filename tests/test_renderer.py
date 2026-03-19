@@ -5,7 +5,8 @@ from contextlib import redirect_stderr, redirect_stdout
 
 from kerndiff.cli import main
 from kerndiff.diff import compute_all_deltas, compute_verdict, sort_deltas
-from kerndiff.renderer import build_json_payload, render_metric_table, render_ptx_diff, render_verdict
+from kerndiff.metrics import METRICS_BY_KEY
+from kerndiff.renderer import build_json_payload, format_delta, render_metric_table, render_ptx_diff, render_verdict
 from kerndiff.roofline import RooflineResult
 
 
@@ -45,6 +46,26 @@ def test_register_delta_is_raw_diff(v1_result, v2_result):
     table = render_metric_table(deltas, v1_result, v2_result, use_color=False)
     assert "+8" in table
     assert "+12.5%" not in table
+
+
+def test_format_delta_int_unit_is_raw_integer():
+    from kerndiff.diff import MetricDelta
+    delta = MetricDelta(
+        metric=METRICS_BY_KEY["registers_per_thread"],
+        v1=64,
+        v2=72,
+        delta_pct=12.5,
+        favorable=False,
+        symbol="-",
+    )
+    assert format_delta(delta) == "+8"
+
+
+def test_shared_mem_delta_uses_kb_units(v1_result, v2_result):
+    deltas = sort_deltas(compute_all_deltas(v1_result.metrics, v2_result.metrics))
+    table = render_metric_table(deltas, v1_result, v2_result, use_color=False)
+    assert "+16" in table
+    assert "+16384" not in table
 
 
 def test_l2_delta_uses_pp(v1_result, v2_result):
@@ -90,6 +111,21 @@ def test_output_file_writes_and_stdout_empty(tmp_path):
     assert rc == 0
     assert stdout.getvalue() == ""
     assert out_file.read_text()
+
+
+def test_json_output_file_writes_and_stdout_empty(tmp_path):
+    out_file = tmp_path / "out.json"
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        rc = main([
+            "--mock", "v1.cu", "v2.cu", "--fn", "chunked_scan_kernel",
+            "--format", "json", "--output", str(out_file),
+        ])
+    assert rc == 0
+    assert stdout.getvalue() == ""
+    payload = json.loads(out_file.read_text())
+    assert "verdict" in payload
 
 
 def test_ptx_diff_absent_when_unchanged(v1_result):

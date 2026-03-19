@@ -146,14 +146,15 @@ def build_harness(source_path: str, kernel_name: str, kernel_call: str, dtype: s
     template = _TEMPLATE.read_text()
     source = Path(source_path).read_text()
     elem_type, dtype_include = DTYPE_MAP.get(dtype, DTYPE_MAP["float"])
+    # Replace source last so placeholder-like text inside user kernels is left untouched.
     harness = (
         template
-        .replace("{{KERNEL_SOURCE}}", source)
         .replace("{{KERNEL_NAME}}", kernel_name)
         .replace("{{KERNEL_CALL}}", kernel_call)
         .replace("{{ELEM_TYPE}}", elem_type)
         .replace("{{DTYPE_INCLUDE}}", dtype_include)
         .replace("{{BUF_ELEMS}}", str(buf_elems))
+        .replace("{{KERNEL_SOURCE}}", source)
     )
     harness_path.write_text(harness)
     return str(harness_path)
