@@ -338,6 +338,40 @@ def _run_correctness_check(
         _emit_correctness_result(max_diff, v1_vals, v2_vals, args.tol, "correctness check", aggregate_warnings)
 
 
+def _profile_variant(
+    *,
+    label: str,
+    mock_prefix: str,
+    binary: str,
+    kernel_name: str,
+    args,
+    physical_gpu_id: int,
+    hardware,
+    binary_env: dict | None,
+    backend,
+    pipeline: int,
+    dump_output: bool = False,
+    show_progress: bool = False,
+):
+    result = profile(
+        binary, kernel_name,
+        max_runs=args.max_runs, min_runs=args.min_runs,
+        noise_threshold=args.noise_threshold, warmup=args.warmup,
+        gpu_id=physical_gpu_id, hardware=hardware,
+        mock=args.mock, mock_prefix=mock_prefix, env=binary_env,
+        pipeline=pipeline, backend=backend,
+        dump_output=dump_output,
+        show_progress=show_progress,
+        progress_label=label,
+    )
+    _emit_status(
+        f"profiling {label} {kernel_name}...",
+        "ok",
+        f"{result.actual_runs} runs  {result.min_latency_us:.0f}us  cv={result.cv_pct:.1f}%",
+    )
+    return result
+
+
 def _run_single_kernel(
     args,
     kernel_name: str,
@@ -356,7 +390,6 @@ def _run_single_kernel(
     elems = buf_elems if buf_elems is not None else args.elems
     pipeline = getattr(args, "pipeline", 1)
 
-    # --- Backend dispatch ---
     backend_a = None
     backend_b = None
     if not args.mock:
@@ -369,7 +402,6 @@ def _run_single_kernel(
         except SystemExit:
             raise
 
-    # --- Compilation ---
     _emit_status(f"compiling {kernel_name}...", "ok")
     if not args.mock:
         binary_a = backend_a.compile(file_a, kernel_name, arch=args.arch, dtype=args.dtype, buf_elems=elems, call_expr=args.call_expr)
@@ -378,7 +410,6 @@ def _run_single_kernel(
         binary_a = file_a
         binary_b = file_b
 
-    # --- Correctness check ---
     do_correctness = getattr(args, "correctness", False)
     if do_correctness and args.mock:
         _emit_status("correctness check...", "skipped", "(mock mode)")
@@ -406,39 +437,34 @@ def _run_single_kernel(
         and sys.stderr.isatty()
     )
 
-    # --- Profiling ---
-    result_a = profile(
-        binary_a, kernel_name,
-        max_runs=args.max_runs, min_runs=args.min_runs,
-        noise_threshold=args.noise_threshold, warmup=args.warmup,
-        gpu_id=physical_gpu_id, hardware=hardware,
-        mock=args.mock, mock_prefix="v1", env=binary_env,
-        pipeline=pipeline, backend=backend_a,
+    result_a = _profile_variant(
+        label="v1",
+        mock_prefix="v1",
+        binary=binary_a,
+        kernel_name=kernel_name,
+        args=args,
+        physical_gpu_id=physical_gpu_id,
+        hardware=hardware,
+        binary_env=binary_env,
+        backend=backend_a,
+        pipeline=pipeline,
         dump_output=_want_dump,
         show_progress=show_progress,
-        progress_label="v1",
-    )
-    _emit_status(
-        f"profiling v1 {kernel_name}...",
-        "ok",
-        f"{result_a.actual_runs} runs  {result_a.min_latency_us:.0f}us  cv={result_a.cv_pct:.1f}%",
     )
 
-    result_b = profile(
-        binary_b, kernel_name,
-        max_runs=args.max_runs, min_runs=args.min_runs,
-        noise_threshold=args.noise_threshold, warmup=args.warmup,
-        gpu_id=physical_gpu_id, hardware=hardware,
-        mock=args.mock, mock_prefix="v2", env=binary_env,
-        pipeline=pipeline, backend=backend_b,
+    result_b = _profile_variant(
+        label="v2",
+        mock_prefix="v2",
+        binary=binary_b,
+        kernel_name=kernel_name,
+        args=args,
+        physical_gpu_id=physical_gpu_id,
+        hardware=hardware,
+        binary_env=binary_env,
+        backend=backend_b,
+        pipeline=pipeline,
         dump_output=_want_dump,
         show_progress=show_progress,
-        progress_label="v2",
-    )
-    _emit_status(
-        f"profiling v2 {kernel_name}...",
-        "ok",
-        f"{result_b.actual_runs} runs  {result_b.min_latency_us:.0f}us  cv={result_b.cv_pct:.1f}%",
     )
 
     if do_correctness:
@@ -450,7 +476,6 @@ def _run_single_kernel(
     for warning in result_a.warnings + result_b.warnings:
         _warn(warning, aggregate_warnings)
 
-    # --- Auto-correctness (fires automatically when comparing two different files) ---
     if _auto_check and not do_correctness:
         v1_vals = result_a.output_vals
         v2_vals = result_b.output_vals
@@ -464,7 +489,6 @@ def _run_single_kernel(
             else:
                 _emit_status("auto-correctness...", "ok", f"max_diff={auto_max_diff:.1e}")
 
-    # --- PTX ---
     if args.mock:
         ptx_a = ptx.load_fixture("v1")
         ptx_b = ptx.load_fixture("v2")
@@ -645,20 +669,28 @@ def _run_shape_sweep(
             binary_a = file_a
             binary_b = file_b
 
-        result_a = profile(
-            binary_a, kernel_name,
-            max_runs=args.max_runs, min_runs=args.min_runs,
-            noise_threshold=args.noise_threshold, warmup=args.warmup,
-            gpu_id=physical_gpu_id, hardware=hardware,
-            mock=args.mock, mock_prefix="v1", env=binary_env,
+        result_a = _profile_variant(
+            label="v1",
+            mock_prefix="v1",
+            binary=binary_a,
+            kernel_name=kernel_name,
+            args=args,
+            physical_gpu_id=physical_gpu_id,
+            hardware=hardware,
+            binary_env=binary_env,
+            backend=None,
             pipeline=pipeline,
         )
-        result_b = profile(
-            binary_b, kernel_name,
-            max_runs=args.max_runs, min_runs=args.min_runs,
-            noise_threshold=args.noise_threshold, warmup=args.warmup,
-            gpu_id=physical_gpu_id, hardware=hardware,
-            mock=args.mock, mock_prefix="v2", env=binary_env,
+        result_b = _profile_variant(
+            label="v2",
+            mock_prefix="v2",
+            binary=binary_b,
+            kernel_name=kernel_name,
+            args=args,
+            physical_gpu_id=physical_gpu_id,
+            hardware=hardware,
+            binary_env=binary_env,
+            backend=None,
             pipeline=pipeline,
         )
         for w in result_a.warnings + result_b.warnings:
@@ -696,7 +728,6 @@ def main(argv: list[str] | None = None) -> int:
     prev_suppress = _SUPPRESS_STDERR
     _SUPPRESS_STDERR = args.format == "json" and not bool(args.export_json)
     try:
-        # --- Config file ---
         config_path = find_config()
         config = {}
         if config_path:
@@ -708,7 +739,6 @@ def main(argv: list[str] | None = None) -> int:
         if config:
             args = apply_config(args, config)
 
-        # --- Validation ---
         if args.fn_name and args.all_kernels:
             raise SystemExit("error: --fn and --all are mutually exclusive")
 
@@ -733,7 +763,6 @@ def main(argv: list[str] | None = None) -> int:
         use_color = not args.no_color and args.format == "term" and sys.stdout.isatty()
         aggregate_warnings: list[str] = []
 
-        # --- Parse shape list ---
         shapes: list[int] | None = None
         if args.shape:
             try:
@@ -743,7 +772,6 @@ def main(argv: list[str] | None = None) -> int:
             if any(s <= 0 for s in shapes):
                 raise SystemExit("error: --shape values must be > 0")
 
-        # --- Watch mode wraps everything ---
         if args.watch:
             return _watch_loop(args, argv)
 
@@ -753,7 +781,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, config=None):
-    # --- GPU / CUDA_VISIBLE_DEVICES resolution ---
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if args.mock:
         hardware = MOCK_HARDWARE
@@ -787,12 +814,10 @@ def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, confi
         if not _SUPPRESS_STDERR:
             print(f"  gpu: {hardware.gpu_name} (device {physical_gpu_id}, {args.arch}, {state})", file=sys.stderr)
 
-    # --- NVML peak bandwidth ---
     nvml_peak_bw = None
     if not args.mock:
         nvml_peak_bw = query_peak_bandwidth_nvml(physical_gpu_id)
 
-    # --- File resolution ---
     git_display_label = None
     if file_b is None:
         if args.mock:
@@ -812,7 +837,6 @@ def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, confi
             if not Path(path).exists():
                 raise SystemExit(f"error: file not found: {path}")
 
-    # --- Resolve kernel name(s) ---
     if args.all_kernels:
         if not Path(file_a).exists() or not Path(file_b).exists():
             raise SystemExit("error: --all requires both files to exist on disk")
@@ -829,7 +853,6 @@ def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, confi
     if config and kernel_names:
         args = apply_config(args, config, kernel_name=kernel_names[0])
 
-    # --- Clock locking ---
     noise_floor = NOISE_FLOOR_LOCKED
     if args.mock:
         hardware.clocks_locked = True
@@ -847,7 +870,6 @@ def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, confi
             _emit_status("locking clocks...", "skipped", "-- results may vary +/-10%")
             _warn("clock locking unavailable (requires sudo). Results may vary +/-10%.", aggregate_warnings)
 
-    # --- Shape sweep mode ---
     if shapes is not None:
         try:
             final_output = _run_shape_sweep(
@@ -865,7 +887,6 @@ def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, confi
             print(final_output)
         return 0
 
-    # --- Profile each kernel ---
     try:
         outputs = []
         for kname in kernel_names:
@@ -881,7 +902,6 @@ def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, confi
             else:
                 outputs.append(output)
 
-        # --- Validate mode ---
         if getattr(args, "validate", False):
             for kname in kernel_names:
                 validate_line = _run_validate(

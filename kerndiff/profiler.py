@@ -305,12 +305,11 @@ def profile(
 
     l2_size_bytes = query_l2_size(gpu_id, gpu_name=hardware.gpu_name)
 
-    # Determine how to run the artifact
     if backend is not None:
         _run_warmup_backend(backend, binary, kernel_name, warmup, run_env)
         latencies, output_vals = _run_timed_backend(
             backend, binary, kernel_name, l2_size_bytes,
-            min_runs, max_runs, noise_threshold, warmup, run_env, warnings,
+            min_runs, max_runs, noise_threshold, warmup, run_env,
             dump_output=dump_output,
             show_progress=show_progress,
             progress_label=progress_label,
@@ -320,7 +319,7 @@ def profile(
         _run_warmup_legacy(binary, kernel_name, warmup, run_env)
         latencies = _run_timed_legacy(
             binary, kernel_name, l2_size_bytes,
-            min_runs, max_runs, noise_threshold, warmup, run_env, warnings,
+            min_runs, max_runs, noise_threshold, run_env,
             show_progress=show_progress,
             progress_label=progress_label,
         )
@@ -363,7 +362,6 @@ def profile(
             f"high variance detected (min={min_latency_us:.1f}us, max={max(latencies):.1f}us). Clock locking recommended."
         )
 
-    # NCU hardware counter collection
     ncu_path = _find_ncu()
     if ncu_path is None:
         warnings.append(
@@ -402,10 +400,8 @@ def profile(
 
         ncu_result = subprocess.run(ncu_cmd, capture_output=True, text=True, env=run_env)
 
-        # NCU puts some errors in stdout, some in stderr
         ncu_all_output = ((ncu_result.stdout or "") + (ncu_result.stderr or "")).lower()
 
-        # If permission denied, retry with sudo
         if ncu_result.returncode != 0 or "err_nvgpuctrperm" in ncu_all_output or ("permission" in ncu_all_output and "\"Metric Name\"" not in (ncu_result.stdout or "")):
             sudo = shutil.which("sudo")
             if sudo:
@@ -490,10 +486,8 @@ def _run_warmup_legacy(binary, kernel_name, warmup, run_env):
 
 def _run_warmup_backend(backend, binary, kernel_name, warmup, run_env):
     """For backend-aware mode, warmup is handled inside the harness."""
-    # Persistent backends (Triton) do warmup during spawn_persistent() startup.
     if hasattr(backend, "is_persistent") and backend.is_persistent():
         return
-    # CUDA backend: warmup via run_cmd with iters=warmup.
     cmd = backend.run_cmd(binary, kernel_name, iters=warmup, l2_flush=0)
     try:
         subprocess.run(cmd, capture_output=True, text=True, check=True, env=run_env)
@@ -517,9 +511,7 @@ def _run_timed_legacy(
     min_runs,
     max_runs,
     noise_threshold,
-    warmup,
     run_env,
-    warnings,
     show_progress: bool = False,
     progress_label: str = "",
 ):
@@ -562,13 +554,11 @@ def _run_timed_backend(
     noise_threshold,
     warmup,
     run_env,
-    warnings,
     dump_output: bool = False,
     show_progress: bool = False,
     progress_label: str = "",
 ):
     """Timed runs using backend. Persistent backends use pipe protocol; others spawn per-run."""
-    # Recompile with L2 flush and correct warmup baked in (Triton persistent only)
     if hasattr(backend, "compile_timed") and hasattr(backend, "_last_compile_args"):
         args = backend._last_compile_args
         binary = backend.compile_timed(
@@ -577,7 +567,6 @@ def _run_timed_backend(
             iters=1, l2_flush_bytes=l2_size_bytes, warmup=warmup,
         )
 
-    # Persistent path: spawn once, communicate via pipes
     if hasattr(backend, "is_persistent") and backend.is_persistent():
         proc = backend.spawn_persistent(binary, env=run_env)
         try:
@@ -599,7 +588,6 @@ def _run_timed_backend(
             _end_progress(show_progress)
         return latencies, captured_output
 
-    # Standard path: one subprocess per timed run (CUDA)
     latencies = []
     cv_pct = float("inf")
     try:

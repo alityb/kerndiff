@@ -61,7 +61,6 @@ def format_delta(delta: MetricDelta) -> str:
 
 def render_verdict(verdict: dict, use_color: bool = True, clocks_locked: bool = True) -> str:
     if verdict["direction"] == "unchanged":
-        pct = abs(verdict["latency_delta_pct"])
         noise_note = f", delta within ±{verdict['v1_cv_pct']:.0f}% noise" if not clocks_locked else ""
         text = (
             f"  no significant latency change  ({verdict['v1_latency_us']:.1f}us vs {verdict['v2_latency_us']:.1f}us"
@@ -82,8 +81,6 @@ def render_verdict(verdict: dict, use_color: bool = True, clocks_locked: bool = 
     unc = verdict.get("speedup_uncertainty_x", 0.0)
     if unc >= 0.02:
         line += f"  ±{unc:.2f}x"
-    if unc >= 0.5:
-        line += "\n  warning: high uncertainty — consider --noise-threshold or clock locking"
     if not clocks_locked:
         noise_ceil = max(verdict["v1_cv_pct"], verdict["v2_cv_pct"]) * 2.0
         line += f"\n  note: clocks not locked — deltas below {noise_ceil:.0f}% may not be reliable"
