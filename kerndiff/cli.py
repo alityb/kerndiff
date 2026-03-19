@@ -238,6 +238,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=32)
     parser.add_argument("--format", choices=["term", "json"], default="term")
     parser.add_argument("--output")
+    parser.add_argument(
+        "--export-json",
+        dest="export_json",
+        metavar="FILE",
+        help="write JSON output to FILE (implies --format json). Progress still shown on stderr.",
+    )
     parser.add_argument("--mock", action="store_true")
     parser.add_argument("--no-color", action="store_true")
     parser.add_argument("--gpu", type=int, default=0)
@@ -381,6 +387,24 @@ def _run_single_kernel(
     # Also dump output for auto-correctness (two different, non-mock, non-git files)
     _auto_check = file_a != file_b and not args.mock and git_display_label is None
     _want_dump = do_correctness or _auto_check
+    if (
+        args.warmup < 25
+        and (
+            (backend_a is not None and backend_a.__class__.__name__ == "TritonBackend")
+            or (backend_b is not None and backend_b.__class__.__name__ == "TritonBackend")
+        )
+    ):
+        _warn(
+            f"warmup={args.warmup} may be insufficient for Triton kernels (JIT compilation takes ~100-500ms). "
+            "Consider --warmup 100 or higher.",
+            aggregate_warnings,
+        )
+
+    show_progress = (
+        ((args.format == "term") or bool(getattr(args, "export_json", None)))
+        and not _SUPPRESS_STDERR
+        and sys.stderr.isatty()
+    )
 
     # --- Profiling ---
     result_a = profile(
@@ -391,6 +415,8 @@ def _run_single_kernel(
         mock=args.mock, mock_prefix="v1", env=binary_env,
         pipeline=pipeline, backend=backend_a,
         dump_output=_want_dump,
+        show_progress=show_progress,
+        progress_label="v1",
     )
     _emit_status(
         f"profiling v1 {kernel_name}...",
@@ -406,6 +432,8 @@ def _run_single_kernel(
         mock=args.mock, mock_prefix="v2", env=binary_env,
         pipeline=pipeline, backend=backend_b,
         dump_output=_want_dump,
+        show_progress=show_progress,
+        progress_label="v2",
     )
     _emit_status(
         f"profiling v2 {kernel_name}...",
@@ -454,6 +482,8 @@ def _run_single_kernel(
 
     deltas = sort_deltas(compute_all_deltas(result_a.metrics, result_b.metrics, noise_floor=noise_floor))
     verdict = compute_verdict(result_a, result_b, noise_floor=noise_floor)
+    if verdict.get("speedup_uncertainty_x", 0.0) >= 0.5:
+        _warn("high uncertainty — consider --noise-threshold or clock locking", aggregate_warnings)
     roofline_v1 = compute_roofline(
         hardware.gpu_name,
         result_a.metrics.get("dram_bw_gbs", 0.0),
@@ -505,6 +535,8 @@ def _run_single_kernel(
             warnings=aggregate_warnings,
             total_hbm=total_hbm,
             pipeline=pipeline,
+            v1_profile=result_a,
+            v2_profile=result_b,
         )
         return render_json(payload)
     else:
@@ -658,8 +690,11 @@ def main(argv: list[str] | None = None) -> int:
     global _SUPPRESS_STDERR
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.export_json:
+        args.format = "json"
+        args.output = args.export_json
     prev_suppress = _SUPPRESS_STDERR
-    _SUPPRESS_STDERR = args.format == "json"
+    _SUPPRESS_STDERR = args.format == "json" and not bool(args.export_json)
     try:
         # --- Config file ---
         config_path = find_config()

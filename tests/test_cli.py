@@ -344,3 +344,18 @@ def test_mock_cli_numeric_display_formats():
     assert "+139.9%" in out         # l1_bank_conflicts (% delta)
     assert "+8" in out              # register_count (raw int diff)
     assert "+16" in out             # shared_mem (KB diff)
+
+
+def test_export_json_implies_json_file_and_keeps_stderr(tmp_path):
+    out_file = tmp_path / "export.json"
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        rc = main([
+            "--mock", "v1.cu", "v2.cu", "--fn", "k",
+            "--export-json", str(out_file),
+        ])
+    assert rc == 0
+    assert stdout.getvalue() == ""
+    assert out_file.exists()
+    assert "gpu: NVIDIA H100 SXM5 80GB (mock)" in stderr.getvalue()

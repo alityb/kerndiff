@@ -53,7 +53,12 @@ class ProfileResult:
     metrics: dict[str, float]
     min_latency_us: float
     all_latencies_us: list[float]
+    clean_latencies_us: list[float]
+    median_latency_us: float
+    p20_latency_us: float
+    p80_latency_us: float
     cv_pct: float
+    n_outliers: int
     ptx_instructions: dict[str, int]
     hardware: HardwareInfo
     warnings: list[str]
@@ -194,6 +199,48 @@ def _compute_cv(values: list[float]) -> float:
     return (stdev(values) / mean(values)) * 100.0 if len(values) > 1 else 0.0
 
 
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+    s = sorted(values)
+    pos = (len(s) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(s) - 1)
+    frac = pos - lo
+    return s[lo] * (1.0 - frac) + s[hi] * frac
+
+
+def _remove_outliers(latencies: list[float]) -> tuple[list[float], int]:
+    """Remove >2x-median runs when safe; keep original list otherwise."""
+    if len(latencies) < 5:
+        return latencies, 0
+    med = median(latencies)
+    clean = [x for x in latencies if x <= med * 2.0]
+    n_removed = len(latencies) - len(clean)
+    if n_removed >= len(latencies) / 2:
+        return latencies, 0
+    return clean, n_removed
+
+
+def _emit_progress(label: str, run_idx: int, max_runs: int, cv_pct: float, enabled: bool) -> None:
+    if not enabled:
+        return
+    cv_text = f"{cv_pct:.1f}%" if run_idx >= 2 else "n/a"
+    print(
+        f"\r  profiling {label}...   run {run_idx}/{max_runs}  current cv={cv_text}",
+        end="",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _end_progress(enabled: bool) -> None:
+    if enabled:
+        print(file=sys.stderr)
+
+
 def _synthesize_latencies(min_latency_us: float, runs: int) -> list[float]:
     rng = random.Random(42)
     latencies = [min_latency_us]
@@ -217,6 +264,8 @@ def profile(
     pipeline: int = 1,
     backend=None,
     dump_output: bool = False,
+    show_progress: bool = False,
+    progress_label: str = "",
 ) -> ProfileResult:
     warnings: list[str] = []
 
@@ -233,7 +282,12 @@ def profile(
             metrics=metrics,
             min_latency_us=min_latency_us,
             all_latencies_us=all_latencies_us,
+            clean_latencies_us=all_latencies_us,
+            median_latency_us=median(all_latencies_us) if all_latencies_us else min_latency_us,
+            p20_latency_us=_percentile(all_latencies_us, 0.2),
+            p80_latency_us=_percentile(all_latencies_us, 0.8),
             cv_pct=cv_pct,
+            n_outliers=0,
             ptx_instructions={},
             hardware=MOCK_HARDWARE,
             warnings=warnings,
@@ -258,6 +312,8 @@ def profile(
             backend, binary, kernel_name, l2_size_bytes,
             min_runs, max_runs, noise_threshold, warmup, run_env, warnings,
             dump_output=dump_output,
+            show_progress=show_progress,
+            progress_label=progress_label,
         )
     else:
         output_vals: list[float] = []
@@ -265,10 +321,29 @@ def profile(
         latencies = _run_timed_legacy(
             binary, kernel_name, l2_size_bytes,
             min_runs, max_runs, noise_threshold, warmup, run_env, warnings,
+            show_progress=show_progress,
+            progress_label=progress_label,
         )
 
-    min_latency_us = min(latencies)
-    cv_pct = _compute_cv(latencies)
+    if not latencies:
+        raise SystemExit(
+            "error: no timing samples were collected\n"
+            f"  binary/artifact: {binary}\n"
+            "  this usually means the harness exited before producing latency output"
+        )
+
+    clean_latencies, n_outliers = _remove_outliers(latencies)
+    if n_outliers > 0:
+        warnings.append(
+            f"{n_outliers} outlier run(s) detected (>2x median), excluded from statistics"
+        )
+    stats_latencies = clean_latencies if clean_latencies else latencies
+
+    min_latency_us = min(stats_latencies)
+    cv_pct = _compute_cv(stats_latencies)
+    median_latency_us = median(stats_latencies)
+    p20_latency_us = _percentile(stats_latencies, 0.2)
+    p80_latency_us = _percentile(stats_latencies, 0.8)
 
     if cv_pct > noise_threshold and len(latencies) >= max_runs:
         warnings.append(
@@ -315,8 +390,11 @@ def profile(
                 "--csv",
                 "--metrics", ncu_metric_names,
                 "--launch-count", str(pipeline),
+                # Harness setup launches two _kerndiff_fill kernels before user kernel.
+                "--launch-skip", "2",
                 "--cache-control", "all",
-                "--clock-control", "base",
+                # Keep NCU counters at the GPU's live frequency to match timed behavior.
+                "--clock-control", "none",
                 binary,
                 "--kernel", kernel_name,
                 "--iters", "1",
@@ -355,6 +433,10 @@ def profile(
                 )
             metrics = {}
         else:
+            if kernel_name and kernel_name not in (ncu_result.stdout or "") and "_kerndiff_fill" in (ncu_result.stdout or ""):
+                warnings.append(
+                    "NCU appears to have profiled _kerndiff_fill instead of the target kernel."
+                )
             if pipeline > 1:
                 metrics = parse_ncu_csv_pipeline(ncu_result.stdout, pipeline)
             else:
@@ -368,7 +450,12 @@ def profile(
         metrics=metrics,
         min_latency_us=min_latency_us,
         all_latencies_us=latencies,
+        clean_latencies_us=stats_latencies,
+        median_latency_us=median_latency_us,
+        p20_latency_us=p20_latency_us,
+        p80_latency_us=p80_latency_us,
         cv_pct=cv_pct,
+        n_outliers=n_outliers,
         ptx_instructions={},
         hardware=hardware,
         warnings=warnings,
@@ -423,33 +510,63 @@ def _run_warmup_backend(backend, binary, kernel_name, warmup, run_env):
         )
 
 
-def _run_timed_legacy(binary, kernel_name, l2_size_bytes, min_runs, max_runs, noise_threshold, warmup, run_env, warnings):
+def _run_timed_legacy(
+    binary,
+    kernel_name,
+    l2_size_bytes,
+    min_runs,
+    max_runs,
+    noise_threshold,
+    warmup,
+    run_env,
+    warnings,
+    show_progress: bool = False,
+    progress_label: str = "",
+):
     latencies: list[float] = []
     cv_pct = float("inf")
-    while len(latencies) < min_runs or (cv_pct > noise_threshold and len(latencies) < max_runs):
-        try:
-            r = subprocess.run(
-                [binary, "--kernel", kernel_name, "--iters", "1", "--l2-flush", str(l2_size_bytes)],
-                capture_output=True, text=True, check=True, env=run_env,
-            )
-        except subprocess.CalledProcessError as e:
-            stderr_text = (e.stderr or "").strip()
-            raise SystemExit(
-                f"error: kernel crashed during timing run (exit code {e.returncode})\n\n"
-                f"  binary: {binary}\n"
-                f"  stderr: {stderr_text}\n\n"
-                f"  this usually means:\n"
-                f"  - buffer size is too small for the kernel's access pattern\n"
-                f"  - the kernel requires a specific launch config (use --call)\n"
-                f"  - the kernel has a bug"
-            )
-        latencies.append(float(r.stdout.strip()))
-        if len(latencies) >= 2:
-            cv_pct = _compute_cv(latencies)
+    try:
+        while len(latencies) < min_runs or (cv_pct > noise_threshold and len(latencies) < max_runs):
+            try:
+                r = subprocess.run(
+                    [binary, "--kernel", kernel_name, "--iters", "1", "--l2-flush", str(l2_size_bytes)],
+                    capture_output=True, text=True, check=True, env=run_env,
+                )
+            except subprocess.CalledProcessError as e:
+                stderr_text = (e.stderr or "").strip()
+                raise SystemExit(
+                    f"error: kernel crashed during timing run (exit code {e.returncode})\n\n"
+                    f"  binary: {binary}\n"
+                    f"  stderr: {stderr_text}\n\n"
+                    f"  this usually means:\n"
+                    f"  - buffer size is too small for the kernel's access pattern\n"
+                    f"  - the kernel requires a specific launch config (use --call)\n"
+                    f"  - the kernel has a bug"
+                )
+            latencies.append(float(r.stdout.strip()))
+            if len(latencies) >= 2:
+                cv_pct = _compute_cv(latencies)
+            _emit_progress(progress_label or kernel_name, len(latencies), max_runs, cv_pct, show_progress)
+    finally:
+        _end_progress(show_progress)
     return latencies
 
 
-def _run_timed_backend(backend, binary, kernel_name, l2_size_bytes, min_runs, max_runs, noise_threshold, warmup, run_env, warnings, dump_output: bool = False):
+def _run_timed_backend(
+    backend,
+    binary,
+    kernel_name,
+    l2_size_bytes,
+    min_runs,
+    max_runs,
+    noise_threshold,
+    warmup,
+    run_env,
+    warnings,
+    dump_output: bool = False,
+    show_progress: bool = False,
+    progress_label: str = "",
+):
     """Timed runs using backend. Persistent backends use pipe protocol; others spawn per-run."""
     # Recompile with L2 flush and correct warmup baked in (Triton persistent only)
     if hasattr(backend, "compile_timed") and hasattr(backend, "_last_compile_args"):
@@ -476,35 +593,41 @@ def _run_timed_backend(backend, binary, kernel_name, l2_size_bytes, min_runs, ma
                 latencies.append(us)
                 if len(latencies) >= 2:
                     cv_pct = _compute_cv(latencies)
+                _emit_progress(progress_label or kernel_name, len(latencies), max_runs, cv_pct, show_progress)
         finally:
             backend.shutdown(proc)
+            _end_progress(show_progress)
         return latencies, captured_output
 
     # Standard path: one subprocess per timed run (CUDA)
     latencies = []
     cv_pct = float("inf")
-    while len(latencies) < min_runs or (cv_pct > noise_threshold and len(latencies) < max_runs):
-        cmd = backend.run_cmd(binary, kernel_name, iters=1, l2_flush=l2_size_bytes)
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, check=True, env=run_env)
-        except subprocess.CalledProcessError as e:
-            stderr_text = (e.stderr or "").strip()
-            raise SystemExit(
-                f"error: kernel crashed during timing run (exit code {e.returncode})\n\n"
-                f"  artifact: {binary}\n"
-                f"  stderr: {stderr_text[:500]}\n\n"
-                f"  this usually means:\n"
-                f"  - the kernel has a bug or import error\n"
-                f"  - buffer size is too small for the kernel's access pattern\n"
-                f"  - the kernel requires a specific launch config (use --call)"
-            )
-        try:
-            latencies.append(float(r.stdout.strip().splitlines()[-1]))
-        except (ValueError, IndexError):
-            raise SystemExit(
-                f"error: could not parse latency from output\n"
-                f"  stdout: {r.stdout[:200]}"
-            )
-        if len(latencies) >= 2:
-            cv_pct = _compute_cv(latencies)
+    try:
+        while len(latencies) < min_runs or (cv_pct > noise_threshold and len(latencies) < max_runs):
+            cmd = backend.run_cmd(binary, kernel_name, iters=1, l2_flush=l2_size_bytes)
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, check=True, env=run_env)
+            except subprocess.CalledProcessError as e:
+                stderr_text = (e.stderr or "").strip()
+                raise SystemExit(
+                    f"error: kernel crashed during timing run (exit code {e.returncode})\n\n"
+                    f"  artifact: {binary}\n"
+                    f"  stderr: {stderr_text[:500]}\n\n"
+                    f"  this usually means:\n"
+                    f"  - the kernel has a bug or import error\n"
+                    f"  - buffer size is too small for the kernel's access pattern\n"
+                    f"  - the kernel requires a specific launch config (use --call)"
+                )
+            try:
+                latencies.append(float(r.stdout.strip().splitlines()[-1]))
+            except (ValueError, IndexError):
+                raise SystemExit(
+                    f"error: could not parse latency from output\n"
+                    f"  stdout: {r.stdout[:200]}"
+                )
+            if len(latencies) >= 2:
+                cv_pct = _compute_cv(latencies)
+            _emit_progress(progress_label or kernel_name, len(latencies), max_runs, cv_pct, show_progress)
+    finally:
+        _end_progress(show_progress)
     return latencies, []

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 from kerndiff.metrics import METRICS, METRICS_BY_KEY, MetricDef
 
@@ -109,6 +110,8 @@ def compute_derived_metrics(metrics: dict) -> dict:
 
 def compute_verdict(v1: "ProfileResult", v2: "ProfileResult", noise_floor: float = NOISE_FLOOR_LOCKED) -> dict:
     speedup = v1.min_latency_us / v2.min_latency_us if v2.min_latency_us else float("inf")
+    rel_err = math.sqrt((v1.cv_pct / 100.0) ** 2 + (v2.cv_pct / 100.0) ** 2)
+    speedup_uncertainty_x = speedup * rel_err
     if abs(speedup - 1.0) < noise_floor:
         direction = "unchanged"
         label = f"no significant change"
@@ -127,9 +130,18 @@ def compute_verdict(v1: "ProfileResult", v2: "ProfileResult", noise_floor: float
         "v1_min_us": min(v1.all_latencies_us) if v1.all_latencies_us else v1.min_latency_us,
         "v1_max_us": max(v1.all_latencies_us) if v1.all_latencies_us else v1.min_latency_us,
         "v1_cv_pct": v1.cv_pct,
+        "v1_p20_us": v1.p20_latency_us,
+        "v1_p50_us": v1.median_latency_us,
+        "v1_p80_us": v1.p80_latency_us,
+        "v1_n_outliers": v1.n_outliers,
         "v2_min_us": min(v2.all_latencies_us) if v2.all_latencies_us else v2.min_latency_us,
         "v2_max_us": max(v2.all_latencies_us) if v2.all_latencies_us else v2.min_latency_us,
         "v2_cv_pct": v2.cv_pct,
+        "v2_p20_us": v2.p20_latency_us,
+        "v2_p50_us": v2.median_latency_us,
+        "v2_p80_us": v2.p80_latency_us,
+        "v2_n_outliers": v2.n_outliers,
+        "speedup_uncertainty_x": speedup_uncertainty_x,
         "noise_floor_pct": noise_floor * 100.0,
         "latency_delta_pct": ((v2.min_latency_us - v1.min_latency_us) / (v1.min_latency_us or 1.0)) * 100.0,
     }

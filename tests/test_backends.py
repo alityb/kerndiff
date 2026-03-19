@@ -70,6 +70,17 @@ def test_triton_ncu_cmd_has_kernel_regex():
     assert "--kernel-name" in cmd
     assert "regex:prefix_scan.*" in cmd
     assert "--target-processes" in cmd
+    assert "--clock-control" in cmd
+    assert cmd[cmd.index("--clock-control") + 1] == "none"
+
+
+def test_cuda_ncu_cmd_has_skip_and_clock_none():
+    b = CUDABackend()
+    cmd = b.ncu_cmd("/usr/bin/ncu", "/tmp/bench", "vec_add", "m1,m2", 1)
+    assert "--launch-skip" in cmd
+    assert cmd[cmd.index("--launch-skip") + 1] == "2"
+    assert "--clock-control" in cmd
+    assert cmd[cmd.index("--clock-control") + 1] == "none"
 
 
 def test_scan_kernels_triton():

@@ -26,6 +26,8 @@ def test_column_widths_expand(v1_result, v2_result):
 def test_latency_row_has_cv(v1_result, v2_result):
     deltas = sort_deltas(compute_all_deltas(v1_result.metrics, v2_result.metrics))
     table = render_metric_table(deltas, v1_result, v2_result, use_color=False)
+    assert "p50" in table
+    assert "p20-p80" in table
     assert re.search(r"latency.*±\d+%.*±\d+%", table)
 
 
@@ -98,8 +100,15 @@ def test_json_has_required_keys(v1_result, v2_result):
     decoded = json.loads(encoded)
     for key in ["hardware", "verdict", "deltas", "ptx_diff", "warnings"]:
         assert key in decoded
-    for key in ["v1_min_us", "v1_max_us", "v1_cv_pct", "v2_min_us", "v2_max_us", "v2_cv_pct"]:
+    for key in [
+        "v1_min_us", "v1_max_us", "v1_cv_pct", "v1_p20_us", "v1_p50_us", "v1_p80_us", "v1_n_outliers",
+        "v2_min_us", "v2_max_us", "v2_cv_pct", "v2_p20_us", "v2_p50_us", "v2_p80_us", "v2_n_outliers",
+        "speedup_uncertainty_x",
+    ]:
         assert key in decoded["verdict"]
+    assert "latencies_us" in decoded["v1"]
+    assert "clean_latencies_us" in decoded["v1"]
+    assert "n_outliers" in decoded["v1"]
 
 
 def test_output_file_writes_and_stdout_empty(tmp_path):
@@ -255,6 +264,13 @@ def test_verdict_unchanged_shows_noise_info(v1_result):
     verdict = compute_verdict(v1_result, v1_result)
     line = render_verdict(verdict, use_color=False, clocks_locked=False)
     assert "noise" in line
+
+
+def test_verdict_shows_uncertainty_for_nontrivial_error(v1_result, v2_result):
+    verdict = compute_verdict(v1_result, v2_result)
+    line = render_verdict(verdict, use_color=False, clocks_locked=True)
+    assert "±" in line
+    assert "x" in line
 
 
 def test_noise_ceiling_question_mark(v1_result, v2_result):

@@ -320,6 +320,6 @@ class TritonBackend:
             "--metrics", metrics,
             "--launch-count", str(launch_count),
             "--cache-control", "all",
-            "--clock-control", "base",
+            "--clock-control", "none",
             python, artifact,
         ]

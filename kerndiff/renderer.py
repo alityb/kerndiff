@@ -79,6 +79,11 @@ def render_verdict(verdict: dict, use_color: bool = True, clocks_locked: bool = 
         f"[v1: {verdict['v1_min_us']:.0f}-{verdict['v1_max_us']:.0f}us +/-{verdict['v1_cv_pct']:.0f}%  "
         f"v2: {verdict['v2_min_us']:.0f}-{verdict['v2_max_us']:.0f}us +/-{verdict['v2_cv_pct']:.0f}%]"
     ).replace("+/-", "±")
+    unc = verdict.get("speedup_uncertainty_x", 0.0)
+    if unc >= 0.02:
+        line += f"  ±{unc:.2f}x"
+    if unc >= 0.5:
+        line += "\n  warning: high uncertainty — consider --noise-threshold or clock locking"
     if not clocks_locked:
         noise_ceil = max(verdict["v1_cv_pct"], verdict["v2_cv_pct"]) * 2.0
         line += f"\n  note: clocks not locked — deltas below {noise_ceil:.0f}% may not be reliable"
@@ -103,8 +108,14 @@ def render_metric_table(
         v1_text = delta.metric.format_fn(delta.v1)
         v2_text = delta.metric.format_fn(delta.v2)
         if delta.metric.key == "latency_us":
-            v1_text = f"{v1_text} ±{v1.cv_pct:.0f}%"
-            v2_text = f"{v2_text} ±{v2.cv_pct:.0f}%"
+            v1_text = (
+                f"{v1_text} (p50 {v1.median_latency_us:.0f}us, "
+                f"p20-p80: {v1.p20_latency_us:.0f}-{v1.p80_latency_us:.0f}us) ±{v1.cv_pct:.0f}%"
+            )
+            v2_text = (
+                f"{v2_text} (p50 {v2.median_latency_us:.0f}us, "
+                f"p20-p80: {v2.p20_latency_us:.0f}-{v2.p80_latency_us:.0f}us) ±{v2.cv_pct:.0f}%"
+            )
 
         symbol = delta.symbol
         styled_symbol = _style_symbol(symbol, use_color)
@@ -214,6 +225,8 @@ def build_json_payload(
     warnings: list[str],
     total_hbm: tuple[float, float] | None = None,
     pipeline: int = 1,
+    v1_profile: ProfileResult | None = None,
+    v2_profile: ProfileResult | None = None,
 ) -> dict:
     payload = {
         "hardware": {
@@ -225,8 +238,18 @@ def build_json_payload(
             "mock": hardware.mock,
         },
         "kernel": kernel_name,
-        "v1": {"file": file_a},
-        "v2": {"file": file_b},
+        "v1": {
+            "file": file_a,
+            "latencies_us": v1_profile.all_latencies_us if v1_profile else [],
+            "clean_latencies_us": v1_profile.clean_latencies_us if v1_profile else [],
+            "n_outliers": v1_profile.n_outliers if v1_profile else 0,
+        },
+        "v2": {
+            "file": file_b,
+            "latencies_us": v2_profile.all_latencies_us if v2_profile else [],
+            "clean_latencies_us": v2_profile.clean_latencies_us if v2_profile else [],
+            "n_outliers": v2_profile.n_outliers if v2_profile else 0,
+        },
         "actual_runs": actual_runs,
         "max_runs": max_runs,
         "min_runs": min_runs,
@@ -236,7 +259,11 @@ def build_json_payload(
         "l2_flush": l2_flush,
         "verdict": {k: verdict[k] for k in [
             "speedup", "direction", "label", "v1_latency_us", "v2_latency_us",
-            "v1_min_us", "v1_max_us", "v1_cv_pct", "v2_min_us", "v2_max_us", "v2_cv_pct",
+            "v1_min_us", "v1_max_us", "v1_cv_pct",
+            "v1_p20_us", "v1_p50_us", "v1_p80_us", "v1_n_outliers",
+            "v2_min_us", "v2_max_us", "v2_cv_pct",
+            "v2_p20_us", "v2_p50_us", "v2_p80_us", "v2_n_outliers",
+            "speedup_uncertainty_x",
         ]},
         "deltas": [
             {
