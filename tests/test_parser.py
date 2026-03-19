@@ -21,9 +21,9 @@ def test_nsecond_converts_to_us():
 
 def test_commas_are_stripped():
     metrics = parse_ncu_csv(
-        '"Metric Name","Metric Unit","Metric Value"\n"inst_executed","inst","312,847"\n'
+        '"Metric Name","Metric Unit","Metric Value"\n"smsp__inst_executed.sum","inst","312,847"\n'
     )
-    assert metrics["ptx_instructions"] == 312847.0
+    assert metrics["inst_executed"] == 312847.0
 
 
 def test_unknown_metric_skipped():
@@ -35,6 +35,6 @@ def test_unknown_metric_skipped():
 
 def test_empty_value_skipped():
     metrics = parse_ncu_csv(
-        '"Metric Name","Metric Unit","Metric Value"\n"inst_executed","inst",""\n'
+        '"Metric Name","Metric Unit","Metric Value"\n"smsp__inst_executed.sum","inst",""\n'
     )
     assert metrics == {}

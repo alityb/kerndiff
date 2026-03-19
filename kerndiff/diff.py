@@ -7,6 +7,9 @@ from kerndiff.metrics import METRICS, METRICS_BY_KEY, MetricDef
 NOISE_FLOOR_LOCKED = 0.02
 NOISE_FLOOR_UNLOCKED = 0.05
 
+# Display order for metric groups
+_GROUP_ORDER = {"sol": 0, "arithmetic": 1, "cache": 2, "warp_state": 3, "launch": 4}
+
 
 @dataclass
 class MetricDelta:
@@ -19,6 +22,9 @@ class MetricDelta:
 
 
 def compute_delta(metric: MetricDef, v1: float, v2: float, noise_floor: float = NOISE_FLOOR_LOCKED) -> MetricDelta:
+    import math
+    if math.isnan(v1) or math.isnan(v2) or math.isinf(v1) or math.isinf(v2):
+        return MetricDelta(metric=metric, v1=v1, v2=v2, delta_pct=0.0, favorable=False, symbol="~")
     denom = abs(v1) if abs(v1) > 1e-12 else 1.0
     delta_pct = ((v2 - v1) / denom) * 100.0
     if metric.lower_is_better is None:
@@ -43,24 +49,68 @@ def compute_delta(metric: MetricDef, v1: float, v2: float, noise_floor: float = 
 def compute_all_deltas(v1_metrics: dict[str, float], v2_metrics: dict[str, float], noise_floor: float = NOISE_FLOOR_LOCKED) -> list[MetricDelta]:
     deltas: list[MetricDelta] = []
     for metric in METRICS:
+        if metric.hidden:
+            continue
         if metric.key in v1_metrics and metric.key in v2_metrics:
             deltas.append(compute_delta(metric, v1_metrics[metric.key], v2_metrics[metric.key], noise_floor))
     return deltas
 
 
 def sort_deltas(deltas: list[MetricDelta]) -> list[MetricDelta]:
-    latency = [d for d in deltas if d.metric.key == "latency_us"]
-    rest = [d for d in deltas if d.metric.key != "latency_us"]
-    changed = sorted((d for d in rest if d.symbol != "~"), key=lambda d: abs(d.delta_pct), reverse=True)
-    unchanged = sorted((d for d in rest if d.symbol == "~"), key=lambda d: d.metric.key)
-    return latency + changed + unchanged
+    """Sort by group order, then non-noisy before noisy within a group, then by metric definition position."""
+    metric_positions = {m.key: i for i, m in enumerate(METRICS)}
+
+    def sort_key(d: MetricDelta) -> tuple:
+        group_idx = _GROUP_ORDER.get(d.metric.group, 99)
+        is_noisy = 1 if d.symbol == "~" else 0
+        pos = metric_positions.get(d.metric.key, 999)
+        return (group_idx, is_noisy, pos)
+
+    return sorted(deltas, key=sort_key)
+
+
+def compute_derived_metrics(metrics: dict) -> dict:
+    """Compute derived metrics (arith_intensity, flops_tflops) from raw NCU counters.
+
+    Call after parse_ncu_csv() and after metrics["latency_us"] is set.
+    Returns a dict of derived key → value to merge into the metrics dict.
+    """
+    derived = {}
+
+    # FP32: ffma = 2 FLOPs (mul + add), fadd/fmul = 1 FLOP each
+    # FP16: same rule applies
+    fp32_flops = (
+        2 * metrics.get("raw_ffma", 0)
+        + metrics.get("raw_fadd", 0)
+        + metrics.get("raw_fmul", 0)
+    )
+    fp16_flops = (
+        2 * metrics.get("raw_hfma", 0)
+        + metrics.get("raw_hadd", 0)
+        + metrics.get("raw_hmul", 0)
+    )
+    total_flops = fp32_flops + fp16_flops
+
+    # DRAM bytes: each sector is 32 bytes
+    dram_bytes = (
+        metrics.get("raw_dram_sectors_rd", 0)
+        + metrics.get("raw_dram_sectors_wr", 0)
+    ) * 32
+
+    if dram_bytes > 0 and total_flops > 0:
+        derived["arith_intensity"] = total_flops / dram_bytes
+
+    latency_us = metrics.get("latency_us", 0)
+    if total_flops > 0 and latency_us > 0:
+        derived["flops_tflops"] = total_flops / (latency_us * 1e-6) / 1e12
+
+    return derived
 
 
 def compute_verdict(v1: "ProfileResult", v2: "ProfileResult", noise_floor: float = NOISE_FLOOR_LOCKED) -> dict:
     speedup = v1.min_latency_us / v2.min_latency_us if v2.min_latency_us else float("inf")
     if abs(speedup - 1.0) < noise_floor:
         direction = "unchanged"
-        pct = abs((v2.min_latency_us - v1.min_latency_us) / (v1.min_latency_us or 1.0)) * 100.0
         label = f"no significant change"
     elif speedup > 1.0:
         direction = "improvement"
@@ -95,5 +145,6 @@ __all__ = [
     "compute_delta",
     "compute_all_deltas",
     "sort_deltas",
+    "compute_derived_metrics",
     "compute_verdict",
 ]

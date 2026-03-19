@@ -30,8 +30,8 @@ def test_exactly_fifteen_percent_favorable_is_double_plus():
 
 
 def test_sort_deltas_latency_first_and_noise_last():
-    v1 = {"latency_us": 100, "l2_hit_rate": 50, "warp_stall_lmem": 3.0}
-    v2 = {"latency_us": 90, "l2_hit_rate": 60, "warp_stall_lmem": 3.03}
+    v1 = {"latency_us": 100, "l2_hit_rate": 50, "stall_memqueue": 3.0}
+    v2 = {"latency_us": 90, "l2_hit_rate": 60, "stall_memqueue": 3.03}
     deltas = sort_deltas(compute_all_deltas(v1, v2))
     assert deltas[0].metric.key == "latency_us"
     noisy_seen = False

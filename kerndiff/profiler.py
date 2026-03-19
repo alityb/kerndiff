@@ -5,10 +5,11 @@ import random
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import mean, median, stdev
 
+from kerndiff.diff import compute_derived_metrics
 from kerndiff.metrics import METRICS_BY_NCU
 from kerndiff.parser import parse_ncu_csv, parse_ncu_csv_pipeline
 
@@ -62,6 +63,7 @@ class ProfileResult:
     noise_threshold: float
     warmup: int
     l2_flush: bool
+    output_vals: list[float] = field(default_factory=list)
 
 
 def query_hardware(gpu_id: int) -> HardwareInfo:
@@ -134,6 +136,29 @@ def _find_ncu() -> str | None:
     return None
 
 
+def query_peak_bandwidth_nvml(gpu_id: int) -> float | None:
+    """Return peak memory bandwidth in GB/s using NVML, or None if unavailable.
+
+    Uses bus_width * mem_clock * 2 (DDR). NVML returns base clock on most drivers,
+    so we always apply the 2x DDR multiplier.
+    """
+    try:
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.filterwarnings("ignore", category=FutureWarning)
+            import pynvml
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+        bus_width_bits = pynvml.nvmlDeviceGetMemoryBusWidth(handle)
+        mem_clock_mhz = pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_MEM)
+        pynvml.nvmlShutdown()
+        # DDR multiplier: NVML returns base clock, multiply by 2
+        peak_bw = (bus_width_bits / 8) * (mem_clock_mhz * 1e6) * 2 / 1e9
+        return peak_bw if peak_bw > 0 else None
+    except Exception:
+        return None
+
+
 def lock_clocks(gpu_id: int) -> bool:
     r1 = subprocess.run(["nvidia-smi", "--lock-gpu-clocks=tdp,tdp", "-i", str(gpu_id)], capture_output=True)
     r2 = subprocess.run(["nvidia-smi", "--lock-memory-clocks=max", "-i", str(gpu_id)], capture_output=True)
@@ -170,6 +195,8 @@ def profile(
     mock_prefix: str = "v1",
     env: dict | None = None,
     pipeline: int = 1,
+    backend=None,
+    dump_output: bool = False,
 ) -> ProfileResult:
     warnings: list[str] = []
 
@@ -180,6 +207,7 @@ def profile(
         all_latencies_us = _synthesize_latencies(min_latency_us, 20)
         cv_pct = _compute_cv(all_latencies_us)
         metrics["latency_us"] = min_latency_us
+        metrics.update(compute_derived_metrics(metrics))
         return ProfileResult(
             kernel_name=kernel_name,
             metrics=metrics,
@@ -203,54 +231,21 @@ def profile(
 
     l2_size_bytes = query_l2_size(gpu_id, gpu_name=hardware.gpu_name)
 
-    # Warmup — no L2 flush
-    try:
-        subprocess.run(
-            [binary, "--kernel", kernel_name, "--iters", str(warmup)],
-            capture_output=True,
-            text=True,
-            check=True,
-            env=run_env,
+    # Determine how to run the artifact
+    if backend is not None:
+        _run_warmup_backend(backend, binary, kernel_name, warmup, run_env)
+        latencies, output_vals = _run_timed_backend(
+            backend, binary, kernel_name, l2_size_bytes,
+            min_runs, max_runs, noise_threshold, warmup, run_env, warnings,
+            dump_output=dump_output,
         )
-    except subprocess.CalledProcessError as e:
-        stderr_text = (e.stderr or "").strip()
-        raise SystemExit(
-            f"error: kernel crashed during warmup (exit code {e.returncode})\n\n"
-            f"  binary: {binary}\n"
-            f"  stderr: {stderr_text}\n\n"
-            f"  this usually means:\n"
-            f"  - buffer size is too small for the kernel's access pattern\n"
-            f"  - the kernel requires a specific launch config (use --call)\n"
-            f"  - the kernel has a bug"
+    else:
+        output_vals: list[float] = []
+        _run_warmup_legacy(binary, kernel_name, warmup, run_env)
+        latencies = _run_timed_legacy(
+            binary, kernel_name, l2_size_bytes,
+            min_runs, max_runs, noise_threshold, warmup, run_env, warnings,
         )
-
-    # Adaptive timed runs with L2 flush
-    latencies: list[float] = []
-    cv_pct = float("inf")
-
-    while len(latencies) < min_runs or (cv_pct > noise_threshold and len(latencies) < max_runs):
-        try:
-            r = subprocess.run(
-                [binary, "--kernel", kernel_name, "--iters", "1", "--l2-flush", str(l2_size_bytes)],
-                capture_output=True,
-                text=True,
-                check=True,
-                env=run_env,
-            )
-        except subprocess.CalledProcessError as e:
-            stderr_text = (e.stderr or "").strip()
-            raise SystemExit(
-                f"error: kernel crashed during timing run (exit code {e.returncode})\n\n"
-                f"  binary: {binary}\n"
-                f"  stderr: {stderr_text}\n\n"
-                f"  this usually means:\n"
-                f"  - buffer size is too small for the kernel's access pattern\n"
-                f"  - the kernel requires a specific launch config (use --call)\n"
-                f"  - the kernel has a bug"
-            )
-        latencies.append(float(r.stdout.strip()))
-        if len(latencies) >= 2:
-            cv_pct = _compute_cv(latencies)
 
     min_latency_us = min(latencies)
     cv_pct = _compute_cv(latencies)
@@ -283,23 +278,29 @@ def profile(
         metrics: dict[str, float] = {}
     else:
         ncu_metric_names = ",".join(METRICS_BY_NCU.keys())
-        ncu_cmd = [
-            ncu_path,
-            "--csv",
-            "--metrics",
-            ncu_metric_names,
-            "--launch-count",
-            str(pipeline),
-            "--cache-control",
-            "all",
-            "--clock-control",
-            "base",
-            binary,
-            "--kernel",
-            kernel_name,
-            "--iters",
-            "1",
-        ]
+
+        if backend is not None:
+            # Triton: use single-run NCU harness (persistent harness can't be used by NCU)
+            ncu_artifact = binary
+            if hasattr(backend, "compile_ncu") and hasattr(backend, "_last_compile_args"):
+                a = backend._last_compile_args
+                ncu_artifact = backend.compile_ncu(
+                    a["source_path"], a["kernel_name"], a["arch"],
+                    a["dtype"], a["buf_elems"], a["call_expr"],
+                )
+            ncu_cmd = backend.ncu_cmd(ncu_path, ncu_artifact, kernel_name, ncu_metric_names, pipeline)
+        else:
+            ncu_cmd = [
+                ncu_path,
+                "--csv",
+                "--metrics", ncu_metric_names,
+                "--launch-count", str(pipeline),
+                "--cache-control", "all",
+                "--clock-control", "base",
+                binary,
+                "--kernel", kernel_name,
+                "--iters", "1",
+            ]
 
         ncu_result = subprocess.run(ncu_cmd, capture_output=True, text=True, env=run_env)
 
@@ -340,6 +341,7 @@ def profile(
                 metrics = parse_ncu_csv(ncu_result.stdout)
 
     metrics["latency_us"] = min_latency_us
+    metrics.update(compute_derived_metrics(metrics))
 
     return ProfileResult(
         kernel_name=kernel_name,
@@ -356,4 +358,133 @@ def profile(
         noise_threshold=noise_threshold,
         warmup=warmup,
         l2_flush=True,
+        output_vals=output_vals,
     )
+
+
+def _run_warmup_legacy(binary, kernel_name, warmup, run_env):
+    try:
+        subprocess.run(
+            [binary, "--kernel", kernel_name, "--iters", str(warmup)],
+            capture_output=True, text=True, check=True, env=run_env,
+        )
+    except subprocess.CalledProcessError as e:
+        stderr_text = (e.stderr or "").strip()
+        raise SystemExit(
+            f"error: kernel crashed during warmup (exit code {e.returncode})\n\n"
+            f"  binary: {binary}\n"
+            f"  stderr: {stderr_text}\n\n"
+            f"  this usually means:\n"
+            f"  - buffer size is too small for the kernel's access pattern\n"
+            f"  - the kernel requires a specific launch config (use --call)\n"
+            f"  - the kernel has a bug"
+        )
+
+
+def _run_warmup_backend(backend, binary, kernel_name, warmup, run_env):
+    """For backend-aware mode, warmup is handled inside the harness."""
+    # Persistent backends (Triton) do warmup during spawn_persistent() startup.
+    if hasattr(backend, "is_persistent") and backend.is_persistent():
+        return
+    # CUDA backend: warmup via run_cmd with iters=warmup.
+    cmd = backend.run_cmd(binary, kernel_name, iters=warmup, l2_flush=0)
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True, env=run_env)
+    except subprocess.CalledProcessError as e:
+        stderr_text = (e.stderr or "").strip()
+        raise SystemExit(
+            f"error: kernel crashed during warmup (exit code {e.returncode})\n\n"
+            f"  artifact: {binary}\n"
+            f"  stderr: {stderr_text[:500]}\n\n"
+            f"  this usually means:\n"
+            f"  - the kernel has a bug or import error\n"
+            f"  - buffer size is too small for the kernel's access pattern\n"
+            f"  - the kernel requires a specific launch config (use --call)"
+        )
+
+
+def _run_timed_legacy(binary, kernel_name, l2_size_bytes, min_runs, max_runs, noise_threshold, warmup, run_env, warnings):
+    latencies: list[float] = []
+    cv_pct = float("inf")
+    while len(latencies) < min_runs or (cv_pct > noise_threshold and len(latencies) < max_runs):
+        try:
+            r = subprocess.run(
+                [binary, "--kernel", kernel_name, "--iters", "1", "--l2-flush", str(l2_size_bytes)],
+                capture_output=True, text=True, check=True, env=run_env,
+            )
+        except subprocess.CalledProcessError as e:
+            stderr_text = (e.stderr or "").strip()
+            raise SystemExit(
+                f"error: kernel crashed during timing run (exit code {e.returncode})\n\n"
+                f"  binary: {binary}\n"
+                f"  stderr: {stderr_text}\n\n"
+                f"  this usually means:\n"
+                f"  - buffer size is too small for the kernel's access pattern\n"
+                f"  - the kernel requires a specific launch config (use --call)\n"
+                f"  - the kernel has a bug"
+            )
+        latencies.append(float(r.stdout.strip()))
+        if len(latencies) >= 2:
+            cv_pct = _compute_cv(latencies)
+    return latencies
+
+
+def _run_timed_backend(backend, binary, kernel_name, l2_size_bytes, min_runs, max_runs, noise_threshold, warmup, run_env, warnings, dump_output: bool = False):
+    """Timed runs using backend. Persistent backends use pipe protocol; others spawn per-run."""
+    # Recompile with L2 flush and correct warmup baked in (Triton persistent only)
+    if hasattr(backend, "compile_timed") and hasattr(backend, "_last_compile_args"):
+        args = backend._last_compile_args
+        binary = backend.compile_timed(
+            args["source_path"], args["kernel_name"], args["arch"],
+            args["dtype"], args["buf_elems"], args["call_expr"],
+            iters=1, l2_flush_bytes=l2_size_bytes, warmup=warmup,
+        )
+
+    # Persistent path: spawn once, communicate via pipes
+    if hasattr(backend, "is_persistent") and backend.is_persistent():
+        proc = backend.spawn_persistent(binary, env=run_env)
+        try:
+            captured_output: list[float] = []
+            if dump_output and hasattr(backend, "dump_output"):
+                captured_output = backend.dump_output(proc)
+            latencies: list[float] = []
+            cv_pct = float("inf")
+            while len(latencies) < min_runs or (
+                cv_pct > noise_threshold and len(latencies) < max_runs
+            ):
+                us = backend.send_time(proc)
+                latencies.append(us)
+                if len(latencies) >= 2:
+                    cv_pct = _compute_cv(latencies)
+        finally:
+            backend.shutdown(proc)
+        return latencies, captured_output
+
+    # Standard path: one subprocess per timed run (CUDA)
+    latencies = []
+    cv_pct = float("inf")
+    while len(latencies) < min_runs or (cv_pct > noise_threshold and len(latencies) < max_runs):
+        cmd = backend.run_cmd(binary, kernel_name, iters=1, l2_flush=l2_size_bytes)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, check=True, env=run_env)
+        except subprocess.CalledProcessError as e:
+            stderr_text = (e.stderr or "").strip()
+            raise SystemExit(
+                f"error: kernel crashed during timing run (exit code {e.returncode})\n\n"
+                f"  artifact: {binary}\n"
+                f"  stderr: {stderr_text[:500]}\n\n"
+                f"  this usually means:\n"
+                f"  - the kernel has a bug or import error\n"
+                f"  - buffer size is too small for the kernel's access pattern\n"
+                f"  - the kernel requires a specific launch config (use --call)"
+            )
+        try:
+            latencies.append(float(r.stdout.strip().splitlines()[-1]))
+        except (ValueError, IndexError):
+            raise SystemExit(
+                f"error: could not parse latency from output\n"
+                f"  stdout: {r.stdout[:200]}"
+            )
+        if len(latencies) >= 2:
+            cv_pct = _compute_cv(latencies)
+    return latencies, []

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import math
 import os
 import re
 import shutil
@@ -273,7 +274,16 @@ def verify_correctness(
     if not v1_vals or not v2_vals:
         return float("inf"), v1_vals, v2_vals
 
-    max_diff = 0.0
-    for a, b in zip(v1_vals, v2_vals):
-        max_diff = max(max_diff, abs(a - b))
+    max_diff = max(_safe_diff(a, b) for a, b in zip(v1_vals, v2_vals))
     return max_diff, v1_vals, v2_vals
+
+
+def _safe_diff(a: float, b: float) -> float:
+    """Return |a-b|, treating NaN and inf as special cases."""
+    if math.isnan(a) and math.isnan(b):
+        return 0.0  # both NaN — consistent (same "wrong" answer)
+    if math.isnan(a) or math.isnan(b):
+        return float("inf")  # one NaN, one real — always fails
+    if math.isinf(a) and math.isinf(b) and (a > 0) == (b > 0):
+        return 0.0  # both same-sign inf — consistent
+    return abs(a - b)

@@ -30,13 +30,20 @@
 static {{ELEM_TYPE}} *d_a = nullptr, *d_b = nullptr, *d_c = nullptr;
 static const int N = BUF_ELEMS;
 
+__global__ void _kerndiff_fill({{ELEM_TYPE}} *buf, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) buf[i] = ({{ELEM_TYPE}})(i % 64 + 1);
+}
+
 static void setup_buffers() {
     if (d_a) return;
     CHECK(cudaMalloc(&d_a, BUF_ELEMS * sizeof({{ELEM_TYPE}})));
     CHECK(cudaMalloc(&d_b, BUF_ELEMS * sizeof({{ELEM_TYPE}})));
     CHECK(cudaMalloc(&d_c, BUF_ELEMS * sizeof({{ELEM_TYPE}})));
-    CHECK(cudaMemset(d_a, 0, BUF_ELEMS * sizeof({{ELEM_TYPE}})));
-    CHECK(cudaMemset(d_b, 0, BUF_ELEMS * sizeof({{ELEM_TYPE}})));
+    _kerndiff_fill<<<(BUF_ELEMS + 255) / 256, 256>>>(d_a, BUF_ELEMS);
+    _kerndiff_fill<<<(BUF_ELEMS + 255) / 256, 256>>>(d_b, BUF_ELEMS);
+    CHECK(cudaDeviceSynchronize());
+    CHECK(cudaMemset(d_c, 0, BUF_ELEMS * sizeof({{ELEM_TYPE}})));
 }
 
 static void run_once() {

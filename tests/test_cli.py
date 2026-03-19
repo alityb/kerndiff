@@ -167,7 +167,7 @@ def test_correctness_flag_accepted_mock():
 def test_shape_flag_invalid_format():
     with pytest.raises(SystemExit) as exc:
         main(["--mock", "v1.cu", "v2.cu", "--fn", "chunked_scan_kernel", "--shape", "abc,def"])
-    assert "comma-separated integers" in str(exc.value)
+    assert "positive integers" in str(exc.value)
 
 
 def test_shape_flag_accepted_mock():

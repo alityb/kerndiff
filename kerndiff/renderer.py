@@ -44,7 +44,7 @@ def format_delta(delta: MetricDelta) -> str:
     metric = delta.metric
     if metric.unit == "%":
         return f"{delta.v2 - delta.v1:+.1f}pp"
-    if metric.unit in {"us", "GB/s", "inst", "count"}:
+    if metric.unit in {"us", "GB/s", "inst", "count", "F/B", "TF"}:
         return f"{delta.delta_pct:+.1f}%"
     # unit == "int" or "B": show raw integer diff
     raw_diff = delta.v2 - delta.v1
@@ -77,7 +77,8 @@ def render_verdict(verdict: dict, use_color: bool = True, clocks_locked: bool = 
         f"v2: {verdict['v2_min_us']:.0f}-{verdict['v2_max_us']:.0f}us +/-{verdict['v2_cv_pct']:.0f}%]"
     ).replace("+/-", "±")
     if not clocks_locked:
-        line += "\n  note: clocks not locked — deltas below 10% may not be reliable"
+        noise_ceil = max(verdict["v1_cv_pct"], verdict["v2_cv_pct"]) * 2.0
+        line += f"\n  note: clocks not locked — deltas below {noise_ceil:.0f}% may not be reliable"
     return line
 
 
@@ -115,7 +116,7 @@ def render_metric_table(
             question = _color("?", "dim", use_color)
             styled_symbol = f"{styled_symbol} {question}"
 
-        rows.append((left, v1_text, v2_text, format_delta(delta), styled_symbol))
+        rows.append((left, v1_text, v2_text, format_delta(delta), styled_symbol, delta.metric.group))
 
     name_w = max(22, len("metric"), *(len(row[0]) for row in rows))
     v1_w = max(14, len("v1"), *(len(row[1]) for row in rows))
@@ -125,7 +126,11 @@ def render_metric_table(
         f"  {'metric':<{name_w}}  {'v1':>{v1_w}}  {'v2':>{v2_w}}  {'delta':>{delta_w}}",
         f"  {'-' * (name_w + v1_w + v2_w + delta_w + 6)}",
     ]
-    for left, v1_text, v2_text, delta_text, symbol in rows:
+    current_group = None
+    for left, v1_text, v2_text, delta_text, symbol, group in rows:
+        if group != current_group and current_group is not None:
+            lines.append("")  # blank line between groups
+        current_group = group
         lines.append(f"  {left:<{name_w}}  {v1_text:>{v1_w}}  {v2_text:>{v2_w}}  {delta_text:>{delta_w}}  {symbol}")
     # Roofline row — skip if both bw and compute are 0 (no data)
     if roofline and roofline.gpu_matched:
@@ -142,9 +147,11 @@ def render_metric_table(
                 bound_text = f"bound: {v1_bound[:3]}->{v2_bound[:3]}"
             else:
                 bound_text = f"bound: {v2_bound}"
-            v1_text = f"{v1_bw * 100:.0f}%bw" if v1_bound == "memory" else f"{v1_compute * 100:.0f}%sm"
-            v2_text = f"{v2_bw * 100:.0f}%bw" if v2_bound == "memory" else f"{v2_compute * 100:.0f}%sm"
+            v1_text = f"v1: {v1_bw * 100:.0f}%bw" if v1_bound == "memory" else f"v1: {v1_compute * 100:.0f}%sm"
+            v2_text = f"v2: {v2_bw * 100:.0f}%bw" if v2_bound == "memory" else f"v2: {v2_compute * 100:.0f}%sm"
             tail = f"{bound_text}  {roofline.headroom_pct:.0f}% headroom"
+            if getattr(roofline, "bw_source", "unknown") == "table":
+                tail += "  [spec]"
             lines.append(
                 f"  {'roofline':<{name_w}}  "
                 f"{v1_text:>{v1_w}}  "
@@ -172,7 +179,7 @@ def render_ptx_diff(rows: list[dict]) -> str:
     v2_w = max(6, *(len(str(r["v2"])) for r in rows))
     delta_w = max(10, *(len(f"{r['delta_pct']:+.1f}%") for r in rows))
     lines = [
-        "  ptx diff",
+        "  ptx diff  (static instruction count — not dynamic execution count)",
         f"  {'-' * (name_w + v1_w + v2_w + delta_w + 6)}",
         f"  {'instruction':<{name_w}}  {'v1':>{v1_w}}  {'v2':>{v2_w}}  {'delta':>{delta_w}}",
     ]
@@ -231,6 +238,7 @@ def build_json_payload(
         "deltas": [
             {
                 "metric": delta.metric.key,
+                "ncu_metric": delta.metric.ncu_metric,
                 "group": delta.metric.group,
                 "lower_is_better": delta.metric.lower_is_better,
                 "v1": delta.v1,
@@ -240,7 +248,10 @@ def build_json_payload(
             }
             for delta in deltas
         ],
-        "ptx_diff": ptx_diff,
+        "ptx_diff": {
+            "note": "static instruction count — not dynamic execution count",
+            "instructions": ptx_diff,
+        },
         "warnings": warnings,
     }
     if roofline and roofline.gpu_matched:

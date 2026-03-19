@@ -30,6 +30,11 @@ def _parse_row(row: dict) -> tuple[str, float] | None:
         value /= 1000.0
     elif raw_unit == "byte/s" or raw_unit == "byte/second":
         value /= 1e9  # convert to GB/s
+    if metric_def.ncu_scale != 1.0:
+        value *= metric_def.ncu_scale
+    # Clamp percentage metrics that can exceed 100 due to NCU replay
+    if metric_def.key in {"global_load_eff", "l1_hit_rate", "thread_active_pct"}:
+        value = max(0.0, min(100.0, value))
     return metric_def.key, value
 
 

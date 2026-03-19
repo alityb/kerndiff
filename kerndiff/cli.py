@@ -11,10 +11,11 @@ import tempfile
 import time
 from pathlib import Path
 
+from kerndiff.backends import dispatch as dispatch_backend
 from kerndiff.compiler import compile_kernel, verify_correctness
 from kerndiff.config import apply_config, find_config, load_config
 from kerndiff.diff import NOISE_FLOOR_LOCKED, NOISE_FLOOR_UNLOCKED, compute_all_deltas, compute_verdict, sort_deltas
-from kerndiff.profiler import MOCK_HARDWARE, lock_clocks, profile, query_hardware, unlock_clocks
+from kerndiff.profiler import MOCK_HARDWARE, lock_clocks, profile, query_hardware, query_peak_bandwidth_nvml, unlock_clocks
 from kerndiff import ptx
 from kerndiff.renderer import (
     build_json_payload, render_json, render_metric_table, render_ptx_diff,
@@ -23,6 +24,7 @@ from kerndiff.renderer import (
 from kerndiff.roofline import compute_roofline
 
 KERNEL_RE = re.compile(r"__global__\s+\w+\s+(\w+)\s*\(")
+TRITON_KERNEL_RE = re.compile(r"@triton\.jit\s+def\s+(\w+)")
 _TEMP_PATHS: list[str] = []
 
 
@@ -66,7 +68,10 @@ def detect_sm_arch(gpu_name: str) -> str | None:
 
 
 def _scan_kernels(path: str) -> list[str]:
-    return KERNEL_RE.findall(Path(path).read_text())
+    text = Path(path).read_text()
+    if path.endswith(".py"):
+        return TRITON_KERNEL_RE.findall(text)
+    return KERNEL_RE.findall(text)
 
 
 def resolve_kernel_name(file_a: str, file_b: str, fn_name: str | None) -> str:
@@ -177,8 +182,9 @@ def resolve_git_baseline(filepath: str, at_ref: str = "HEAD") -> tuple[str, str]
             f"  (commit it first, or pass two files explicitly)"
         )
 
+    suffix = abs_path.suffix or ".cu"
     tmp = tempfile.NamedTemporaryFile(
-        suffix=".cu", prefix="kerndiff_head_", delete=False, mode="w",
+        suffix=suffix, prefix="kerndiff_head_", delete=False, mode="w",
     )
     tmp.write(head_content.stdout)
     tmp.close()
@@ -190,7 +196,7 @@ def resolve_git_baseline(filepath: str, at_ref: str = "HEAD") -> tuple[str, str]
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kerndiff", add_help=True)
-    parser.add_argument("files", nargs="+", help=".cu file(s)")
+    parser.add_argument("files", nargs="+", help=".cu or .py file(s)")
     parser.add_argument("--fn", dest="fn_name")
     parser.add_argument("--all", dest="all_kernels", action="store_true",
                         help="profile all common kernels in both files")
@@ -227,6 +233,60 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _safe_diff(a: float, b: float) -> float:
+    import math
+    if math.isnan(a) or math.isnan(b):
+        return float("nan")
+    if math.isinf(a) or math.isinf(b):
+        return float("inf")
+    return abs(a - b)
+
+
+def _emit_correctness_result(
+    max_diff: float,
+    v1_vals: list[float],
+    v2_vals: list[float],
+    tol: float,
+    label: str,
+    aggregate_warnings: list[str],
+) -> None:
+    import math
+    if math.isnan(max_diff) or max_diff > tol:
+        summary = f"max_diff={max_diff:.4g}"
+        if v1_vals and v2_vals:
+            summary += f"  (first 4: v1={v1_vals[:4]} v2={v2_vals[:4]})"
+        _emit_status(f"{label}...", "FAILED", summary)
+        _warn(f"outputs differ ({summary}) — speedup may reflect a bug, not an optimization", aggregate_warnings)
+    else:
+        _emit_status(f"{label}...", "ok", f"max_diff={max_diff:.1e}")
+
+
+def _run_correctness_check(
+    args,
+    binary_a: str,
+    binary_b: str,
+    backend_a,
+    binary_env: dict | None,
+    result_a,
+    result_b,
+    aggregate_warnings: list[str],
+) -> None:
+    """Run correctness check — routes through dump path for Triton, verify_correctness for CUDA."""
+    is_triton = backend_a is not None and hasattr(backend_a, "is_persistent") and backend_a.is_persistent()
+    if is_triton:
+        v1_vals = result_a.output_vals
+        v2_vals = result_b.output_vals
+        if not v1_vals or not v2_vals:
+            _emit_status("correctness check...", "skipped", "(dump returned no values)")
+            return
+        diffs = [_safe_diff(a, b) for a, b in zip(v1_vals, v2_vals)]
+        max_diff = max(diffs)
+        _emit_correctness_result(max_diff, v1_vals, v2_vals, args.tol, "correctness check", aggregate_warnings)
+    else:
+        max_diff, v1_vals, v2_vals = verify_correctness(binary_a, binary_b, env=binary_env)
+        _emit_correctness_result(max_diff, v1_vals, v2_vals, args.tol, "correctness check", aggregate_warnings)
+
+
 def _run_single_kernel(
     args,
     kernel_name: str,
@@ -239,33 +299,43 @@ def _run_single_kernel(
     aggregate_warnings: list[str],
     use_color: bool,
     buf_elems: int | None = None,
+    nvml_peak_bw: float | None = None,
+    git_display_label: str | None = None,
 ) -> str:
     elems = buf_elems if buf_elems is not None else args.elems
     pipeline = getattr(args, "pipeline", 1)
 
+    # --- Backend dispatch ---
+    backend_a = None
+    backend_b = None
+    if not args.mock:
+        try:
+            backend_a = dispatch_backend(file_a)
+        except SystemExit:
+            raise
+        try:
+            backend_b = dispatch_backend(file_b)
+        except SystemExit:
+            raise
+
     # --- Compilation ---
     _emit_status(f"compiling {kernel_name}...", "ok")
     if not args.mock:
-        binary_a = compile_kernel(file_a, kernel_name, arch=args.arch, mock=False, kernel_call=args.call_expr, dtype=args.dtype, buf_elems=elems)
-        binary_b = compile_kernel(file_b, kernel_name, arch=args.arch, mock=False, kernel_call=args.call_expr, dtype=args.dtype, buf_elems=elems)
+        binary_a = backend_a.compile(file_a, kernel_name, arch=args.arch, dtype=args.dtype, buf_elems=elems, call_expr=args.call_expr)
+        binary_b = backend_b.compile(file_b, kernel_name, arch=args.arch, dtype=args.dtype, buf_elems=elems, call_expr=args.call_expr)
     else:
         binary_a = file_a
         binary_b = file_b
 
     # --- Correctness check ---
-    if getattr(args, "correctness", False):
-        if args.mock:
-            _emit_status("correctness check...", "skipped", "(mock mode)")
-        else:
-            max_diff, v1_vals, v2_vals = verify_correctness(binary_a, binary_b, env=binary_env)
-            if max_diff > args.tol:
-                summary = f"max_diff={max_diff:.4g}"
-                if v1_vals and v2_vals:
-                    summary += f"  (first 4: v1={v1_vals[:4]} v2={v2_vals[:4]})"
-                _emit_status("correctness check...", "FAILED", summary)
-                _warn(f"outputs differ ({summary}) — speedup may reflect a bug, not an optimization", aggregate_warnings)
-            else:
-                _emit_status("correctness check...", "ok", f"max_diff={max_diff:.1e}")
+    do_correctness = getattr(args, "correctness", False)
+    if do_correctness and args.mock:
+        _emit_status("correctness check...", "skipped", "(mock mode)")
+        do_correctness = False
+
+    # Also dump output for auto-correctness (two different, non-mock, non-git files)
+    _auto_check = file_a != file_b and not args.mock and git_display_label is None
+    _want_dump = do_correctness or _auto_check
 
     # --- Profiling ---
     result_a = profile(
@@ -274,7 +344,8 @@ def _run_single_kernel(
         noise_threshold=args.noise_threshold, warmup=args.warmup,
         gpu_id=physical_gpu_id, hardware=hardware,
         mock=args.mock, mock_prefix="v1", env=binary_env,
-        pipeline=pipeline,
+        pipeline=pipeline, backend=backend_a,
+        dump_output=_want_dump,
     )
     _emit_status(
         f"profiling v1 {kernel_name}...",
@@ -288,7 +359,8 @@ def _run_single_kernel(
         noise_threshold=args.noise_threshold, warmup=args.warmup,
         gpu_id=physical_gpu_id, hardware=hardware,
         mock=args.mock, mock_prefix="v2", env=binary_env,
-        pipeline=pipeline,
+        pipeline=pipeline, backend=backend_b,
+        dump_output=_want_dump,
     )
     _emit_status(
         f"profiling v2 {kernel_name}...",
@@ -296,16 +368,42 @@ def _run_single_kernel(
         f"{result_b.actual_runs} runs  {result_b.min_latency_us:.0f}us  cv={result_b.cv_pct:.1f}%",
     )
 
+    if do_correctness:
+        _run_correctness_check(
+            args, binary_a, binary_b, backend_a, binary_env,
+            result_a, result_b, aggregate_warnings,
+        )
+
     for warning in result_a.warnings + result_b.warnings:
         _warn(warning, aggregate_warnings)
+
+    # --- Auto-correctness (fires automatically when comparing two different files) ---
+    if _auto_check and not do_correctness:
+        v1_vals = result_a.output_vals
+        v2_vals = result_b.output_vals
+        if v1_vals and v2_vals:
+            auto_diffs = [_safe_diff(a, b) for a, b in zip(v1_vals, v2_vals)]
+            auto_max_diff = max(auto_diffs)
+            import math
+            if math.isnan(auto_max_diff) or auto_max_diff > 1e-2:
+                _emit_status("auto-correctness...", "warning",
+                             f"max_diff={auto_max_diff:.3g} (outputs differ — verify kernels compute same function)")
+            else:
+                _emit_status("auto-correctness...", "ok", f"max_diff={auto_max_diff:.1e}")
 
     # --- PTX ---
     if args.mock:
         ptx_a = ptx.load_fixture("v1")
         ptx_b = ptx.load_fixture("v2")
     else:
-        ptx_a = ptx.extract_ptx(file_a, arch=args.arch)
-        ptx_b = ptx.extract_ptx(file_b, arch=args.arch)
+        try:
+            ptx_a = backend_a.extract_ptx(file_a, arch=args.arch)
+        except Exception:
+            ptx_a = {}
+        try:
+            ptx_b = backend_b.extract_ptx(file_b, arch=args.arch)
+        except Exception:
+            ptx_b = {}
     result_a.ptx_instructions = ptx_a
     result_b.ptx_instructions = ptx_b
 
@@ -315,11 +413,13 @@ def _run_single_kernel(
         hardware.gpu_name,
         result_a.metrics.get("dram_bw_gbs", 0.0),
         result_a.metrics.get("sm_throughput", 0.0),
+        nvml_peak_bw=nvml_peak_bw,
     )
     roofline = compute_roofline(
         hardware.gpu_name,
         result_b.metrics.get("dram_bw_gbs", 0.0),
         result_b.metrics.get("sm_throughput", 0.0),
+        nvml_peak_bw=nvml_peak_bw,
     )
     ptx_diff = ptx.diff_ptx(ptx_a, ptx_b)
 
@@ -453,6 +553,7 @@ def _run_shape_sweep(
     noise_floor: float,
     aggregate_warnings: list[str],
     shapes: list[int],
+    nvml_peak_bw: float | None = None,
 ) -> str:
     """Run the diff at each shape and produce a summary table."""
     rows = []
@@ -489,8 +590,8 @@ def _run_shape_sweep(
         dram_a = result_a.metrics.get("dram_bw_gbs", 0.0)
         dram_b = result_b.metrics.get("dram_bw_gbs", 0.0)
         dram_delta = ((dram_b - dram_a) / dram_a * 100) if dram_a > 0 else 0.0
-        roofline_a = compute_roofline(hardware.gpu_name, dram_a, result_a.metrics.get("sm_throughput", 0.0))
-        roofline_b = compute_roofline(hardware.gpu_name, dram_b, result_b.metrics.get("sm_throughput", 0.0))
+        roofline_a = compute_roofline(hardware.gpu_name, dram_a, result_a.metrics.get("sm_throughput", 0.0), nvml_peak_bw=nvml_peak_bw)
+        roofline_b = compute_roofline(hardware.gpu_name, dram_b, result_b.metrics.get("sm_throughput", 0.0), nvml_peak_bw=nvml_peak_bw)
         bound_a = roofline_a.bound[:3] if roofline_a.gpu_matched else "?"
         bound_b = roofline_b.bound[:3] if roofline_b.gpu_matched else "?"
         bound_str = f"{bound_a}->{bound_b}" if bound_a != bound_b else bound_b
@@ -531,7 +632,13 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("error: --pipeline requires --call")
 
     if len(args.files) not in {1, 2}:
-        parser.error("expected one or two .cu files")
+        parser.error("expected one or two .cu or .py files")
+
+    if args.elems <= 0:
+        raise SystemExit("error: --elems must be > 0")
+
+    if args.min_runs > args.max_runs:
+        raise SystemExit(f"error: --min-runs ({args.min_runs}) cannot exceed --max-runs ({args.max_runs})")
 
     file_a = args.files[0]
     file_b = args.files[1] if len(args.files) == 2 else None
@@ -548,7 +655,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             shapes = [int(s.strip()) for s in args.shape.split(",")]
         except ValueError:
-            raise SystemExit("error: --shape must be comma-separated integers (e.g. 1024,2048,4096)")
+            raise SystemExit("error: --shape values must be positive integers (e.g. 1024,2048,4096)")
+        if any(s <= 0 for s in shapes):
+            raise SystemExit("error: --shape values must be > 0")
 
     # --- Watch mode wraps everything ---
     if args.watch:
@@ -589,6 +698,11 @@ def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, confi
                 args.arch = detected_arch
         state = "clocks locked" if hardware.clocks_locked else "clocks unlocked"
         print(f"  gpu: {hardware.gpu_name} (device {physical_gpu_id}, {args.arch}, {state})", file=sys.stderr)
+
+    # --- NVML peak bandwidth ---
+    nvml_peak_bw = None
+    if not args.mock:
+        nvml_peak_bw = query_peak_bandwidth_nvml(physical_gpu_id)
 
     # --- File resolution ---
     git_display_label = None
@@ -651,6 +765,7 @@ def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, confi
                 args, kernel_names[0], file_a, file_b,
                 hardware, physical_gpu_id, binary_env,
                 noise_floor, aggregate_warnings, shapes,
+                nvml_peak_bw=nvml_peak_bw,
             )
         finally:
             if not args.mock:
@@ -669,6 +784,8 @@ def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, confi
                 args, kname, file_a, file_b,
                 hardware, physical_gpu_id, binary_env,
                 noise_floor, aggregate_warnings, use_color,
+                nvml_peak_bw=nvml_peak_bw,
+                git_display_label=git_display_label,
             )
             if len(kernel_names) > 1:
                 outputs.append(f"\n=== {kname} ===\n{output}")
