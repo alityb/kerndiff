@@ -270,10 +270,13 @@ def _run_correctness_check(
     result_a,
     result_b,
     aggregate_warnings: list[str],
+    backend_b=None,
 ) -> None:
     """Run correctness check — routes through dump path for Triton, verify_correctness for CUDA."""
-    is_triton = backend_a is not None and hasattr(backend_a, "is_persistent") and backend_a.is_persistent()
-    if is_triton:
+    def _is_persistent(b):
+        return b is not None and hasattr(b, "is_persistent") and b.is_persistent()
+
+    if _is_persistent(backend_a) or _is_persistent(backend_b):
         v1_vals = result_a.output_vals
         v2_vals = result_b.output_vals
         if not v1_vals or not v2_vals:
@@ -371,7 +374,7 @@ def _run_single_kernel(
     if do_correctness:
         _run_correctness_check(
             args, binary_a, binary_b, backend_a, binary_env,
-            result_a, result_b, aggregate_warnings,
+            result_a, result_b, aggregate_warnings, backend_b=backend_b,
         )
 
     for warning in result_a.warnings + result_b.warnings:

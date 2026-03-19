@@ -160,9 +160,29 @@ def query_peak_bandwidth_nvml(gpu_id: int) -> float | None:
 
 
 def lock_clocks(gpu_id: int) -> bool:
-    r1 = subprocess.run(["nvidia-smi", "--lock-gpu-clocks=tdp,tdp", "-i", str(gpu_id)], capture_output=True)
-    r2 = subprocess.run(["nvidia-smi", "--lock-memory-clocks=max", "-i", str(gpu_id)], capture_output=True)
-    return r1.returncode == 0 and r2.returncode == 0
+    r1 = subprocess.run(
+        ["nvidia-smi", "--lock-gpu-clocks=tdp,tdp", "-i", str(gpu_id)],
+        capture_output=True,
+    )
+    if r1.returncode != 0:
+        return False
+    # Query max supported memory clock and lock to it
+    query = subprocess.run(
+        ["nvidia-smi", "--query-supported-clocks=mem", "--format=csv,noheader", "-i", str(gpu_id)],
+        capture_output=True, text=True,
+    )
+    if query.returncode == 0:
+        for line in query.stdout.splitlines():
+            try:
+                max_mem_mhz = int(line.strip().split()[0])
+                subprocess.run(
+                    ["nvidia-smi", f"--lock-memory-clocks={max_mem_mhz}", "-i", str(gpu_id)],
+                    capture_output=True,
+                )
+                break
+            except (ValueError, IndexError):
+                pass
+    return True
 
 
 def unlock_clocks(gpu_id: int) -> None:
