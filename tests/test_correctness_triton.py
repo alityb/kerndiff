@@ -3,15 +3,17 @@ import io
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 
+import kerndiff
+
 import pytest
 
 
-FIXTURES = Path(__file__).parent.parent / "kerndiff" / "fixtures"
+FIXTURES = Path(kerndiff.__file__).resolve().parent / "fixtures"
 PERSISTENT_TEMPLATE = FIXTURES / "harness_template_triton_persistent.py"
 
 
 def test_triton_backend_has_dump_output_method():
-    from kerndiff.backends.triton import TritonBackend
+    from kerndiff.runtimes.triton import TritonBackend
     b = TritonBackend()
     assert hasattr(b, "dump_output"), "TritonBackend must have dump_output() method"
     import inspect

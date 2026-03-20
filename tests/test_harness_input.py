@@ -1,7 +1,9 @@
 """Tests ensuring harness templates use non-trivial (non-zero) input buffers."""
 from pathlib import Path
 
-FIXTURES = Path(__file__).parent.parent / "kerndiff" / "fixtures"
+import kerndiff
+
+FIXTURES = Path(kerndiff.__file__).resolve().parent / "fixtures"
 
 
 def test_cuda_harness_fill_kernel_exists():

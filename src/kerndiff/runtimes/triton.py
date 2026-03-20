@@ -42,7 +42,7 @@ def _check_triton():
         import triton  # noqa: F401
     except ImportError:
         raise SystemExit(
-            "error: Triton backend requires triton — install with: pip install triton"
+            "error: Triton runtime requires triton — install with: pip install triton"
         )
 
 

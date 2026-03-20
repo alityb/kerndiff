@@ -11,7 +11,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from kerndiff.backends import dispatch as dispatch_backend
+from kerndiff.runtimes import dispatch as dispatch_runtime
 from kerndiff.compiler import compile_kernel, verify_correctness
 from kerndiff.config import apply_config, find_config, load_config
 from kerndiff.diff import NOISE_FLOOR_LOCKED, NOISE_FLOOR_UNLOCKED, compute_all_deltas, compute_verdict, sort_deltas
@@ -306,19 +306,19 @@ def _run_correctness_check(
     args,
     binary_a: str,
     binary_b: str,
-    backend_a,
+    runtime_a,
     binary_env: dict | None,
     result_a,
     result_b,
     aggregate_warnings: list[str],
-    backend_b=None,
+    runtime_b=None,
 ) -> None:
     """Run correctness check — routes through dump path for Triton, verify_correctness for CUDA."""
     def _is_persistent(b):
         return b is not None and hasattr(b, "is_persistent") and b.is_persistent()
 
-    persistent_a = _is_persistent(backend_a)
-    persistent_b = _is_persistent(backend_b)
+    persistent_a = _is_persistent(runtime_a)
+    persistent_b = _is_persistent(runtime_b)
 
     if persistent_a or persistent_b:
         v1_vals = result_a.output_vals
@@ -348,7 +348,7 @@ def _profile_variant(
     physical_gpu_id: int,
     hardware,
     binary_env: dict | None,
-    backend,
+    runtime,
     pipeline: int,
     dump_output: bool = False,
     show_progress: bool = False,
@@ -359,7 +359,7 @@ def _profile_variant(
         noise_threshold=args.noise_threshold, warmup=args.warmup,
         gpu_id=physical_gpu_id, hardware=hardware,
         mock=args.mock, mock_prefix=mock_prefix, env=binary_env,
-        pipeline=pipeline, backend=backend,
+        pipeline=pipeline, backend=runtime,
         dump_output=dump_output,
         show_progress=show_progress,
         progress_label=label,
@@ -390,22 +390,22 @@ def _run_single_kernel(
     elems = buf_elems if buf_elems is not None else args.elems
     pipeline = getattr(args, "pipeline", 1)
 
-    backend_a = None
-    backend_b = None
+    runtime_a = None
+    runtime_b = None
     if not args.mock:
         try:
-            backend_a = dispatch_backend(file_a)
+            runtime_a = dispatch_runtime(file_a)
         except SystemExit:
             raise
         try:
-            backend_b = dispatch_backend(file_b)
+            runtime_b = dispatch_runtime(file_b)
         except SystemExit:
             raise
 
     _emit_status(f"compiling {kernel_name}...", "ok")
     if not args.mock:
-        binary_a = backend_a.compile(file_a, kernel_name, arch=args.arch, dtype=args.dtype, buf_elems=elems, call_expr=args.call_expr)
-        binary_b = backend_b.compile(file_b, kernel_name, arch=args.arch, dtype=args.dtype, buf_elems=elems, call_expr=args.call_expr)
+        binary_a = runtime_a.compile(file_a, kernel_name, arch=args.arch, dtype=args.dtype, buf_elems=elems, call_expr=args.call_expr)
+        binary_b = runtime_b.compile(file_b, kernel_name, arch=args.arch, dtype=args.dtype, buf_elems=elems, call_expr=args.call_expr)
     else:
         binary_a = file_a
         binary_b = file_b
@@ -421,8 +421,8 @@ def _run_single_kernel(
     if (
         args.warmup < 25
         and (
-            (backend_a is not None and backend_a.__class__.__name__ == "TritonBackend")
-            or (backend_b is not None and backend_b.__class__.__name__ == "TritonBackend")
+            (runtime_a is not None and runtime_a.__class__.__name__ == "TritonBackend")
+            or (runtime_b is not None and runtime_b.__class__.__name__ == "TritonBackend")
         )
     ):
         _warn(
@@ -446,7 +446,7 @@ def _run_single_kernel(
         physical_gpu_id=physical_gpu_id,
         hardware=hardware,
         binary_env=binary_env,
-        backend=backend_a,
+        runtime=runtime_a,
         pipeline=pipeline,
         dump_output=_want_dump,
         show_progress=show_progress,
@@ -461,7 +461,7 @@ def _run_single_kernel(
         physical_gpu_id=physical_gpu_id,
         hardware=hardware,
         binary_env=binary_env,
-        backend=backend_b,
+        runtime=runtime_b,
         pipeline=pipeline,
         dump_output=_want_dump,
         show_progress=show_progress,
@@ -469,8 +469,8 @@ def _run_single_kernel(
 
     if do_correctness:
         _run_correctness_check(
-            args, binary_a, binary_b, backend_a, binary_env,
-            result_a, result_b, aggregate_warnings, backend_b=backend_b,
+            args, binary_a, binary_b, runtime_a, binary_env,
+            result_a, result_b, aggregate_warnings, runtime_b=runtime_b,
         )
 
     for warning in result_a.warnings + result_b.warnings:
@@ -494,11 +494,11 @@ def _run_single_kernel(
         ptx_b = ptx.load_fixture("v2")
     else:
         try:
-            ptx_a = backend_a.extract_ptx(file_a, arch=args.arch)
+            ptx_a = runtime_a.extract_ptx(file_a, arch=args.arch)
         except Exception:
             ptx_a = {}
         try:
-            ptx_b = backend_b.extract_ptx(file_b, arch=args.arch)
+            ptx_b = runtime_b.extract_ptx(file_b, arch=args.arch)
         except Exception:
             ptx_b = {}
     result_a.ptx_instructions = ptx_a
@@ -678,7 +678,7 @@ def _run_shape_sweep(
             physical_gpu_id=physical_gpu_id,
             hardware=hardware,
             binary_env=binary_env,
-            backend=None,
+            runtime=None,
             pipeline=pipeline,
         )
         result_b = _profile_variant(
@@ -690,7 +690,7 @@ def _run_shape_sweep(
             physical_gpu_id=physical_gpu_id,
             hardware=hardware,
             binary_env=binary_env,
-            backend=None,
+            runtime=None,
             pipeline=pipeline,
         )
         for w in result_a.warnings + result_b.warnings:

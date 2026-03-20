@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Protocol
 
 
-class Backend(Protocol):
+class Runtime(Protocol):
     def compile(
         self,
         source_path: str,
@@ -32,13 +32,13 @@ class Backend(Protocol):
         ...
 
 
-def dispatch(filepath: str) -> Backend:
-    """Return the appropriate backend for a given file extension."""
+def dispatch(filepath: str) -> Runtime:
+    """Return the appropriate runtime for a given file extension."""
     if filepath.endswith(".py"):
-        from kerndiff.backends.triton import TritonBackend
+        from kerndiff.runtimes.triton import TritonBackend
         return TritonBackend()
     elif filepath.endswith(".cu"):
-        from kerndiff.backends.cuda import CUDABackend
+        from kerndiff.runtimes.cuda import CUDABackend
         return CUDABackend()
     else:
         ext = filepath.rsplit(".", 1)[-1] if "." in filepath else "(none)"

@@ -1,53 +1,122 @@
-```text
-  gpu: NVIDIA H100 SXM5 80GB (mock)
-warning: mock mode -- no GPU required.
-  compiling...                            ok  0.0s
-  warming up (32 iters)...                ok
-  profiling v1 (min of 20)...             ok  247us
-  profiling v2 (min of 20)...             ok  189us
-  extracting ptx...                       ok
-  v2 is 1.31x faster  (247.3us -> 189.1us)  [v1: 247-256us ±1%  v2: 189-196us ±1%]
-  metric                              v1              v2       delta
-  ------------------------------------------------------------------
-  latency                    247.3us ±1%     189.1us ±1%      -23.5%  ++
-  l1_bank_conflicts                 124K            297K       +173K  --
-  shared_mem                        16KB            32KB       +16KB  ++
-  l2_hit_rate                      41.2%           67.4%     +26.2pp  ++
-  warp_stall_mio                    18.2             7.1      -61.0%  ++
-  sm_throughput                    61.3%           79.4%     +18.1pp  ++
-  memory_throughput                72.1%           89.3%     +17.2pp  ++
-  dram_bw                          412.3           509.1      +23.5%  ++
-  ptx_instructions                312847          247300      -65547  ++
-  sm_occupancy                     62.4%           51.2%     -11.2pp  --
-  register_count                      64              72          +8  -
-  l1_hit_rate                      38.1%           41.0%      +2.9pp  +
-  warp_divergence                   2.1%            2.0%      -0.1pp  +
-  global_load_eff                  79.3%           82.1%      +2.8pp  +
-  warp_stall_lmem                   3.1%            3.0%      -0.1pp  +
-  ------------------------------------------------------------------
-  roofline [compute]               12%bw           15%bw  21% headroom
-  ptx diff
-  ----------------------------------------------
-  instruction             v1      v2       delta
-  ld.shared               12      28      +133.3%
-  st.shared               24      48      +100.0%
-  ld.global               48      31       -35.4%
-  bar.sync                 3       4       +33.3%
+# kerndiff
+
+`kerndiff` compares two CUDA or Triton kernel implementations on the same GPU and reports:
+- end-to-end latency (adaptive multi-run timing)
+- Nsight Compute counters
+- derived metrics and deltas
+- static PTX instruction diffs
+- a compact roofline summary
+
+It is designed for practical iteration: change a kernel, run one command, and see if it is faster and why.
+
+## Install
+
+```bash
+pip install -e .
 ```
 
-## install
-pip install -e .
+## Quickstart
 
-## usage
-kerndiff v1.cu v2.cu --fn kernel_name     # explicit diff
-kerndiff kernel.cu --fn kernel_name       # diff against last git commit
+```bash
+kerndiff examples/vec_add_v1.cu examples/vec_add_v2.cu --fn vec_add
+```
 
-## options
---runs N       timing runs, take min (default 20)
---warmup N     warmup iters before timing (default 32)
---format       term | json
---output FILE  write output to file
---no-color     disable ANSI
---gpu N        GPU device index (default 0)
---arch X       nvcc SM arch (auto-detected from GPU name if not set)
---mock         fixture data, no GPU needed
+Mock mode (no GPU required):
+
+```bash
+kerndiff --mock examples/vec_add_v1.cu examples/vec_add_v2.cu --fn vec_add --no-color
+```
+
+## Common workflows
+
+Compare two files:
+
+```bash
+kerndiff v1.cu v2.cu --fn my_kernel
+```
+
+Compare `HEAD` vs working copy for one tracked file:
+
+```bash
+kerndiff kernel.cu --fn my_kernel
+```
+
+Run all common kernels in two files:
+
+```bash
+kerndiff a.cu b.cu --all
+```
+
+Write JSON output:
+
+```bash
+kerndiff a.cu b.cu --fn k --format json > result.json
+```
+
+Write JSON to file while keeping stderr progress:
+
+```bash
+kerndiff a.cu b.cu --fn k --export-json result.json
+```
+
+## Key options
+
+- `--fn NAME`: kernel name
+- `--all`: profile all common kernels
+- `--call "kernel<<<...>>>(...)"`: override launch expression
+- `--dtype {float,half,int,int4}`: harness buffer dtype
+- `--elems N`: harness buffer size
+- `--min-runs N`, `--max-runs N`: adaptive timing bounds
+- `--noise-threshold PCT`: CV stop threshold
+- `--warmup N`: warmup iterations
+- `--format {term,json}`: output format
+- `--output FILE`: write output to file
+- `--export-json FILE`: write JSON file and keep stderr progress
+- `--no-color`: disable ANSI colors
+- `--gpu N`: GPU index
+- `--arch sm_XX`: target SM architecture
+- `--mock`: fixture-backed run without GPU
+
+## Output interpretation
+
+Primary signal:
+- `latency` row and verdict line (`v2 is ... faster/slower`)
+
+Frequent supporting signals:
+- `global_load_eff`: memory coalescing quality
+- `dram_bw`: achieved memory bandwidth
+- `l2_hit_rate`: cache locality/reuse
+- `register_count` and `sm_occupancy`: register pressure tradeoff
+- `stall_*`: dominant stall sources
+
+Roofline row:
+- reports `memory` vs `compute` bound and estimated headroom
+
+PTX diff:
+- static instruction counts only (not dynamic execution counts)
+
+## Repository layout
+
+This repository uses a `src` layout:
+
+- `src/kerndiff/`: package code
+- `src/kerndiff/runtimes/`: runtime-specific compilation and execution adapters (`cuda`, `triton`)
+- `examples/`: benchmark kernels
+- `tests/`: test suite
+
+## Development
+
+Run tests:
+
+```bash
+python -m pytest tests/ -q
+```
+
+## Troubleshooting
+
+If Nsight Compute metrics are missing:
+- ensure `ncu` is installed
+- run with elevated permissions if needed on your system
+
+If `nvcc` is not found:
+- ensure CUDA toolkit is installed or available in your Python CUDA environment

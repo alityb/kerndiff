@@ -3,13 +3,15 @@ import io
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 
+import kerndiff
+
 import pytest
 
-from kerndiff.backends.triton import TritonBackend
-from kerndiff.backends.cuda import CUDABackend
+from kerndiff.runtimes.triton import TritonBackend
+from kerndiff.runtimes.cuda import CUDABackend
 
 
-FIXTURES = Path(__file__).parent.parent / "kerndiff" / "fixtures"
+FIXTURES = Path(kerndiff.__file__).resolve().parent / "fixtures"
 PERSISTENT_TEMPLATE = FIXTURES / "harness_template_triton_persistent.py"
 
 

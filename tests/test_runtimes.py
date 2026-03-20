@@ -1,8 +1,8 @@
 import pytest
 
-from kerndiff.backends import dispatch
-from kerndiff.backends.cuda import CUDABackend
-from kerndiff.backends.triton import TritonBackend, parse_triton_kernels
+from kerndiff.runtimes import dispatch
+from kerndiff.runtimes.cuda import CUDABackend
+from kerndiff.runtimes.triton import TritonBackend, parse_triton_kernels
 
 
 def test_dispatch_cuda():

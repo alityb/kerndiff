@@ -1,9 +1,11 @@
 from pathlib import Path
 
+import kerndiff
+
 from kerndiff.parser import parse_ncu_csv
 
 
-FIXTURES = Path(__file__).resolve().parents[1] / "kerndiff" / "fixtures"
+FIXTURES = Path(kerndiff.__file__).resolve().parent / "fixtures"
 
 
 def test_v1_fixture_parses():
