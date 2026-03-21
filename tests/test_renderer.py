@@ -26,15 +26,13 @@ def test_column_widths_expand(v1_result, v2_result):
 def test_latency_row_has_cv(v1_result, v2_result):
     deltas = sort_deltas(compute_all_deltas(v1_result.metrics, v2_result.metrics))
     table = render_metric_table(deltas, v1_result, v2_result, use_color=False)
-    assert "p50" in table
-    assert "p20-p80" in table
     assert re.search(r"latency.*±\d+%.*±\d+%", table)
 
 
 def test_verdict_line_has_range_for_improvement(v1_result, v2_result):
     verdict = compute_verdict(v1_result, v2_result)
     line = render_verdict(verdict, use_color=False)
-    assert "[v1:" in line
+    assert "±" in line
 
 
 def test_verdict_line_omits_range_for_unchanged(v1_result):

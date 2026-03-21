@@ -306,19 +306,28 @@ def _run_correctness_check(
     args,
     binary_a: str,
     binary_b: str,
-    runtime_a,
-    binary_env: dict | None,
-    result_a,
-    result_b,
-    aggregate_warnings: list[str],
+    backend_a=None,
+    binary_env: dict | None = None,
+    result_a=None,
+    result_b=None,
+    aggregate_warnings: list[str] | None = None,
+    backend_b=None,
+    # legacy aliases kept for internal callers
+    runtime_a=None,
     runtime_b=None,
 ) -> None:
     """Run correctness check — routes through dump path for Triton, verify_correctness for CUDA."""
+    if aggregate_warnings is None:
+        aggregate_warnings = []
+    # Accept either backend_a or runtime_a (legacy name)
+    effective_a = backend_a if backend_a is not None else runtime_a
+    effective_b = backend_b if backend_b is not None else runtime_b
+
     def _is_persistent(b):
         return b is not None and hasattr(b, "is_persistent") and b.is_persistent()
 
-    persistent_a = _is_persistent(runtime_a)
-    persistent_b = _is_persistent(runtime_b)
+    persistent_a = _is_persistent(effective_a)
+    persistent_b = _is_persistent(effective_b)
 
     if persistent_a or persistent_b:
         v1_vals = result_a.output_vals
@@ -469,8 +478,10 @@ def _run_single_kernel(
 
     if do_correctness:
         _run_correctness_check(
-            args, binary_a, binary_b, runtime_a, binary_env,
-            result_a, result_b, aggregate_warnings, runtime_b=runtime_b,
+            args, binary_a, binary_b,
+            backend_a=runtime_a, binary_env=binary_env,
+            result_a=result_a, result_b=result_b,
+            aggregate_warnings=aggregate_warnings, backend_b=runtime_b,
         )
 
     for warning in result_a.warnings + result_b.warnings:

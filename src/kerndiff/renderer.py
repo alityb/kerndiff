@@ -60,12 +60,13 @@ def format_delta(delta: MetricDelta) -> str:
 
 
 def render_verdict(verdict: dict, use_color: bool = True, clocks_locked: bool = True) -> str:
+    v1_us = verdict["v1_latency_us"]
+    v2_us = verdict["v2_latency_us"]
+    v1_cv = verdict["v1_cv_pct"]
+    v2_cv = verdict["v2_cv_pct"]
     if verdict["direction"] == "unchanged":
-        noise_note = f", delta within ±{verdict['v1_cv_pct']:.0f}% noise" if not clocks_locked else ""
-        text = (
-            f"  no significant latency change  ({verdict['v1_latency_us']:.1f}us vs {verdict['v2_latency_us']:.1f}us"
-            f"{noise_note})"
-        )
+        noise_note = f"  (±{max(v1_cv, v2_cv):.0f}% noise)" if not clocks_locked else ""
+        text = f"  no significant change  {v1_us:.1f}us vs {v2_us:.1f}us{noise_note}"
         return _color(text, "dim", use_color)
     if verdict["direction"] == "improvement":
         label = _color(verdict["label"], "green", use_color)
@@ -73,16 +74,13 @@ def render_verdict(verdict: dict, use_color: bool = True, clocks_locked: bool = 
     else:
         label = _color(verdict["label"], "red", use_color)
         label = f"{ANSI['bold']}{label}{ANSI['reset']}" if use_color else label
-    line = (
-        f"  {label}  ({verdict['v1_latency_us']:.1f}us -> {verdict['v2_latency_us']:.1f}us)  "
-        f"[v1: {verdict['v1_min_us']:.0f}-{verdict['v1_max_us']:.0f}us +/-{verdict['v1_cv_pct']:.0f}%  "
-        f"v2: {verdict['v2_min_us']:.0f}-{verdict['v2_max_us']:.0f}us +/-{verdict['v2_cv_pct']:.0f}%]"
-    ).replace("+/-", "±")
+    cv_note = f"  (v1 ±{v1_cv:.0f}%  v2 ±{v2_cv:.0f}%)"
+    line = f"  {label}  {v1_us:.1f}us → {v2_us:.1f}us{cv_note}"
     unc = verdict.get("speedup_uncertainty_x", 0.0)
     if unc >= 0.02:
         line += f"  ±{unc:.2f}x"
     if not clocks_locked:
-        noise_ceil = max(verdict["v1_cv_pct"], verdict["v2_cv_pct"]) * 2.0
+        noise_ceil = max(v1_cv, v2_cv) * 2.0
         line += f"\n  note: clocks not locked — deltas below {noise_ceil:.0f}% may not be reliable"
     return line
 
@@ -105,14 +103,8 @@ def render_metric_table(
         v1_text = delta.metric.format_fn(delta.v1)
         v2_text = delta.metric.format_fn(delta.v2)
         if delta.metric.key == "latency_us":
-            v1_text = (
-                f"{v1_text} (p50 {v1.median_latency_us:.0f}us, "
-                f"p20-p80: {v1.p20_latency_us:.0f}-{v1.p80_latency_us:.0f}us) ±{v1.cv_pct:.0f}%"
-            )
-            v2_text = (
-                f"{v2_text} (p50 {v2.median_latency_us:.0f}us, "
-                f"p20-p80: {v2.p20_latency_us:.0f}-{v2.p80_latency_us:.0f}us) ±{v2.cv_pct:.0f}%"
-            )
+            v1_text = f"{v1_text} ±{v1.cv_pct:.0f}%"
+            v2_text = f"{v2_text} ±{v2.cv_pct:.0f}%"
 
         symbol = delta.symbol
         styled_symbol = _style_symbol(symbol, use_color)
@@ -135,7 +127,7 @@ def render_metric_table(
     delta_w = max(10, len("delta"), *(len(row[3]) for row in rows))
     lines = [
         f"  {'metric':<{name_w}}  {'v1':>{v1_w}}  {'v2':>{v2_w}}  {'delta':>{delta_w}}",
-        f"  {'-' * (name_w + v1_w + v2_w + delta_w + 6)}",
+        f"  {'─' * (name_w + v1_w + v2_w + delta_w + 6)}",
     ]
     current_group = None
     for left, v1_text, v2_text, delta_text, symbol, group in rows:
@@ -151,7 +143,7 @@ def render_metric_table(
         v2_compute = roofline.compute_utilization
         has_data = (v1_bw > 0 or v1_compute > 0 or v2_bw > 0 or v2_compute > 0)
         if has_data:
-            lines.append(f"  {'-' * (name_w + v1_w + v2_w + delta_w + 6)}")
+            lines.append(f"  {'─' * (name_w + v1_w + v2_w + delta_w + 6)}")
             v1_bound = "memory" if v1_bw > v1_compute else "compute"
             v2_bound = roofline.bound
             if v1_bound != v2_bound:
@@ -191,7 +183,7 @@ def render_ptx_diff(rows: list[dict]) -> str:
     delta_w = max(10, *(len(f"{r['delta_pct']:+.1f}%") for r in rows))
     lines = [
         "  ptx diff  (static instruction count — not dynamic execution count)",
-        f"  {'-' * (name_w + v1_w + v2_w + delta_w + 6)}",
+        f"  {'─' * (name_w + v1_w + v2_w + delta_w + 6)}",
         f"  {'instruction':<{name_w}}  {'v1':>{v1_w}}  {'v2':>{v2_w}}  {'delta':>{delta_w}}",
     ]
     for row in rows:
