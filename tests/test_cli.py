@@ -51,7 +51,8 @@ def test_single_file_mock_mode_skips_git(tmp_path):
     with redirect_stdout(stdout), redirect_stderr(stderr):
         rc = main(["--mock", str(file_a), "--fn", "chunked_scan_kernel"])
     assert rc == 0
-    assert "mock mode -- no GPU required." in stderr.getvalue()
+    # warnings are deferred to final output (stdout) in term format, not stderr
+    assert "mock mode -- no GPU required." in stdout.getvalue()
 
 
 def test_all_and_fn_mutually_exclusive():

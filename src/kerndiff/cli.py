@@ -27,6 +27,7 @@ KERNEL_RE = re.compile(r"__global__\s+\w+\s+(\w+)\s*\(")
 TRITON_KERNEL_RE = re.compile(r"@triton\.jit\s+def\s+(\w+)")
 _TEMP_PATHS: list[str] = []
 _SUPPRESS_STDERR = False
+_DEFER_WARNINGS = False  # when True, collect warnings but don't print to stderr
 
 
 def _cleanup_temp_paths() -> None:
@@ -144,9 +145,15 @@ def _emit_status(label: str, status: str, suffix: str = "") -> None:
 
 def _warn(msg: str, warnings: list[str]) -> None:
     warnings.append(msg)
-    if _SUPPRESS_STDERR:
+    if _SUPPRESS_STDERR or _DEFER_WARNINGS:
         return
     print(f"warning: {msg}", file=sys.stderr)
+
+
+def _color_warn(msg: str, use_color: bool) -> str:
+    if use_color:
+        return f"  \033[33m⚠\033[0m  {msg}"
+    return f"  !  {msg}"
 
 
 def resolve_git_baseline(filepath: str, at_ref: str = "HEAD") -> tuple[str, str]:
@@ -244,6 +251,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="write JSON output to FILE (implies --format json). Progress still shown on stderr.",
     )
+    parser.add_argument("--ptx", action="store_true", help="show PTX instruction diff (hidden by default)")
     parser.add_argument("--mock", action="store_true")
     parser.add_argument("--no-color", action="store_true")
     parser.add_argument("--gpu", type=int, default=0)
@@ -517,7 +525,9 @@ def _run_single_kernel(
 
     deltas = sort_deltas(compute_all_deltas(result_a.metrics, result_b.metrics, noise_floor=noise_floor))
     verdict = compute_verdict(result_a, result_b, noise_floor=noise_floor)
-    if verdict.get("speedup_uncertainty_x", 0.0) >= 0.5:
+    unc = verdict.get("speedup_uncertainty_x", 0.0)
+    speedup = abs(verdict.get("speedup", 1.0))
+    if unc >= 0.5 and (speedup < 0.01 or unc / speedup >= 0.1):
         _warn("high uncertainty — consider --noise-threshold or clock locking", aggregate_warnings)
     roofline_v1 = compute_roofline(
         hardware.gpu_name,
@@ -577,6 +587,7 @@ def _run_single_kernel(
     else:
         sections = [
             render_verdict(verdict, use_color=use_color, clocks_locked=clocks_locked),
+            "",
             render_metric_table(
                 deltas,
                 result_a,
@@ -590,9 +601,13 @@ def _run_single_kernel(
                 noise_ceiling=noise_ceiling,
             ),
         ]
-        ptx_section = render_ptx_diff(ptx_diff)
-        if ptx_section:
-            sections.append(ptx_section)
+        if getattr(args, "ptx", False):
+            ptx_section = render_ptx_diff(ptx_diff)
+            if ptx_section:
+                sections.append(ptx_section)
+        if aggregate_warnings:
+            sections.append("")
+            sections.extend(_color_warn(w, use_color) for w in aggregate_warnings)
         return "\n".join(sections)
 
 
@@ -792,6 +807,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, config=None):
+    global _DEFER_WARNINGS
+    _DEFER_WARNINGS = (args.format == "term")
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if args.mock:
         hardware = MOCK_HARDWARE
@@ -927,6 +944,7 @@ def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, confi
         if not args.mock:
             unlock_clocks(physical_gpu_id)
 
+    _DEFER_WARNINGS = False
     if args.output:
         write_output(final_output, args.output)
     else:

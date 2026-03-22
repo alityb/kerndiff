@@ -13,8 +13,11 @@ ANSI = {
     "bold": "\033[1m",
     "dim": "\033[2m",
     "green": "\033[32m",
+    "bright_green": "\033[92m",
     "yellow": "\033[33m",
     "red": "\033[31m",
+    "bright_red": "\033[91m",
+    "cyan": "\033[36m",
 }
 
 
@@ -22,6 +25,18 @@ def _color(text: str, code: str, use_color: bool) -> str:
     if not use_color or not code:
         return text
     return f"{ANSI[code]}{text}{ANSI['reset']}"
+
+
+def _dim(text: str, use_color: bool) -> str:
+    if not use_color:
+        return text
+    return f"{ANSI['dim']}{text}{ANSI['reset']}"
+
+
+def _bold(text: str, use_color: bool) -> str:
+    if not use_color:
+        return text
+    return f"{ANSI['bold']}{text}{ANSI['reset']}"
 
 
 def _style_symbol(symbol: str, use_color: bool) -> str:
@@ -69,16 +84,16 @@ def render_verdict(verdict: dict, use_color: bool = True, clocks_locked: bool = 
         text = f"  no significant change  {v1_us:.1f}us vs {v2_us:.1f}us{noise_note}"
         return _color(text, "dim", use_color)
     if verdict["direction"] == "improvement":
-        label = _color(verdict["label"], "green", use_color)
-        label = f"{ANSI['bold']}{label}{ANSI['reset']}" if use_color else label
+        label = f"{ANSI['bold']}{ANSI['bright_green']}{verdict['label']}{ANSI['reset']}" if use_color else verdict["label"]
     else:
-        label = _color(verdict["label"], "red", use_color)
-        label = f"{ANSI['bold']}{label}{ANSI['reset']}" if use_color else label
-    cv_note = f"  (v1 ±{v1_cv:.0f}%  v2 ±{v2_cv:.0f}%)"
-    line = f"  {label}  {v1_us:.1f}us → {v2_us:.1f}us{cv_note}"
+        label = f"{ANSI['bold']}{ANSI['bright_red']}{verdict['label']}{ANSI['reset']}" if use_color else verdict["label"]
+    cv_note = _dim(f"  (v1 ±{v1_cv:.0f}%  v2 ±{v2_cv:.0f}%)", use_color)
+    arrow = _dim("→", use_color)
+    timing = f"  {v1_us:.1f}us {arrow} {v2_us:.1f}us"
+    line = f"  {label}{timing}{cv_note}"
     unc = verdict.get("speedup_uncertainty_x", 0.0)
     if unc >= 0.02:
-        line += f"  ±{unc:.2f}x"
+        line += _dim(f"  ±{unc:.2f}x", use_color)
     if not clocks_locked:
         noise_ceil = max(v1_cv, v2_cv) * 2.0
         line += f"\n  note: clocks not locked — deltas below {noise_ceil:.0f}% may not be reliable"
@@ -119,22 +134,54 @@ def render_metric_table(
             question = _color("?", "dim", use_color)
             styled_symbol = f"{styled_symbol} {question}"
 
-        rows.append((left, v1_text, v2_text, format_delta(delta), styled_symbol, delta.metric.group))
+        # Color v2 value: green if favorable improvement, red if unfavorable
+        v2_colored = v2_text
+        if use_color and symbol in ("+", "++"):
+            v2_colored = _color(v2_text, "bright_green", use_color)
+        elif use_color and symbol in ("-", "--"):
+            v2_colored = _color(v2_text, "bright_red", use_color)
 
-    name_w = max(22, len("metric"), *(len(row[0]) for row in rows))
-    v1_w = max(14, len("v1"), *(len(row[1]) for row in rows))
-    v2_w = max(14, len("v2"), *(len(row[2]) for row in rows))
-    delta_w = max(10, len("delta"), *(len(row[3]) for row in rows))
-    lines = [
-        f"  {'metric':<{name_w}}  {'v1':>{v1_w}}  {'v2':>{v2_w}}  {'delta':>{delta_w}}",
-        f"  {'─' * (name_w + v1_w + v2_w + delta_w + 6)}",
-    ]
+        rows.append((left, v1_text, v2_colored, v2_text, format_delta(delta), styled_symbol, delta.metric.group))
+
+    name_w = max(18, *(len(row[0]) for row in rows))
+    v1_w = max(12, *(len(row[1]) for row in rows))
+    v2_w = max(12, *(len(row[3]) for row in rows))  # raw v2 for width
+    delta_w = max(8, *(len(row[4]) for row in rows))
+    # symbol column is 2 wide (++/--) plus 2 padding = 4; but we reserve 4 after delta
+    total_w = name_w + v1_w + v2_w + delta_w + 6
+    sep = f"  {'─' * total_w}"
+
+    # ANSI-aware padding: raw is the printable string for width calc, styled may have codes
+    def lpad(styled: str, raw: str, w: int) -> str:
+        return styled + " " * (w - len(raw))
+
+    def rpad(styled: str, raw: str, w: int) -> str:
+        return " " * (w - len(raw)) + styled
+
+    lines: list[str] = []
     current_group = None
-    for left, v1_text, v2_text, delta_text, symbol, group in rows:
-        if group != current_group and current_group is not None:
-            lines.append("")  # blank line between groups
-        current_group = group
-        lines.append(f"  {left:<{name_w}}  {v1_text:>{v1_w}}  {v2_text:>{v2_w}}  {delta_text:>{delta_w}}  {symbol}")
+    group_labels = {
+        "sol": "throughput",
+        "arithmetic": "arithmetic",
+        "cache": "cache",
+        "warp_state": "warp state",
+        "launch": "launch config",
+    }
+    for left, v1_text, v2_colored, v2_text, delta_text, symbol, group in rows:
+        if group != current_group:
+            if current_group is not None:
+                lines.append("")
+            label = group_labels.get(group, group)
+            dashes = "─" * max(0, total_w - len(label) - 4)
+            lines.append(_dim(f"  ── {label} {dashes}", use_color))
+            current_group = group
+        lines.append(
+            f"  {lpad(_dim(left, use_color), left, name_w)}"
+            f"  {rpad(v1_text, v1_text, v1_w)}"
+            f"  {rpad(v2_colored, v2_text, v2_w)}"
+            f"  {rpad(delta_text, delta_text, delta_w)}"
+            f"  {symbol}"
+        )
     # Roofline row — skip if both bw and compute are 0 (no data)
     if roofline and roofline.gpu_matched:
         v1_bw = roofline_v1_bw if roofline_v1_bw is not None else 0.0
@@ -143,7 +190,7 @@ def render_metric_table(
         v2_compute = roofline.compute_utilization
         has_data = (v1_bw > 0 or v1_compute > 0 or v2_bw > 0 or v2_compute > 0)
         if has_data:
-            lines.append(f"  {'─' * (name_w + v1_w + v2_w + delta_w + 6)}")
+            lines.append(_dim(sep, use_color))
             v1_bound = "memory" if v1_bw > v1_compute else "compute"
             v2_bound = roofline.bound
             if v1_bound != v2_bound:
@@ -156,20 +203,21 @@ def render_metric_table(
             if getattr(roofline, "bw_source", "unknown") == "table":
                 tail += "  [spec]"
             lines.append(
-                f"  {'roofline':<{name_w}}  "
-                f"{v1_text:>{v1_w}}  "
-                f"{v2_text:>{v2_w}}  "
-                f"{tail:>{delta_w}}"
+                f"  {lpad(_dim('roofline', use_color), 'roofline', name_w)}"
+                f"  {rpad(v1_text, v1_text, v1_w)}"
+                f"  {rpad(v2_text, v2_text, v2_w)}"
+                f"  {rpad(tail, tail, delta_w)}"
             )
     # Total HBM row (pipeline mode only)
     if total_hbm is not None:
         gb_a, gb_b = total_hbm
         delta_pct = ((gb_b - gb_a) / gb_a * 100) if gb_a > 0 else 0.0
+        s_a, s_b, s_d = f"{gb_a:.3f}GB", f"{gb_b:.3f}GB", f"{delta_pct:+.1f}%"
         lines.append(
-            f"  {'total_hbm':<{name_w}}  "
-            f"{f'{gb_a:.3f}GB':>{v1_w}}  "
-            f"{f'{gb_b:.3f}GB':>{v2_w}}  "
-            f"{f'{delta_pct:+.1f}%':>{delta_w}}"
+            f"  {lpad(_dim('total_hbm', use_color), 'total_hbm', name_w)}"
+            f"  {rpad(s_a, s_a, v1_w)}"
+            f"  {rpad(s_b, s_b, v2_w)}"
+            f"  {rpad(s_d, s_d, delta_w)}"
         )
     return "\n".join(lines)
 
