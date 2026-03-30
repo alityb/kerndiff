@@ -6,7 +6,14 @@ from contextlib import redirect_stderr, redirect_stdout
 from kerndiff.cli import main
 from kerndiff.diff import compute_all_deltas, compute_verdict, sort_deltas
 from kerndiff.metrics import METRICS_BY_KEY
-from kerndiff.renderer import build_json_payload, format_delta, render_metric_table, render_ptx_diff, render_verdict
+from kerndiff.renderer import (
+    build_json_payload,
+    format_delta,
+    render_perfetto_trace,
+    render_metric_table,
+    render_ptx_diff,
+    render_verdict,
+)
 from kerndiff.roofline import RooflineResult
 
 
@@ -107,6 +114,97 @@ def test_json_has_required_keys(v1_result, v2_result):
     assert "latencies_us" in decoded["v1"]
     assert "clean_latencies_us" in decoded["v1"]
     assert "n_outliers" in decoded["v1"]
+    assert "summary" in decoded["v1"]
+    assert "histogram" in decoded["v1"]
+    assert "clock_telemetry" in decoded["v1"]
+    assert "trace" in decoded
+
+
+def test_json_latency_summary_has_percentiles(v1_result, v2_result):
+    deltas = sort_deltas(compute_all_deltas(v1_result.metrics, v2_result.metrics))
+    verdict = compute_verdict(v1_result, v2_result)
+    payload = build_json_payload(
+        hardware=v1_result.hardware,
+        kernel_name=v1_result.kernel_name,
+        file_a="v1.cu",
+        file_b="v2.cu",
+        actual_runs=20,
+        max_runs=50,
+        min_runs=10,
+        noise_threshold=1.0,
+        warmup=32,
+        l2_flush=False,
+        verdict=verdict,
+        deltas=deltas,
+        roofline=RooflineResult("memory", 0.72, 0.89, 11.0, True),
+        ptx_diff=[],
+        warnings=[],
+        v1_profile=v1_result,
+        v2_profile=v2_result,
+    )
+    summary = payload["v1"]["summary"]
+    assert summary["runs"] == len(v1_result.all_latencies_us)
+    assert summary["clean_runs"] == len(v1_result.clean_latencies_us)
+    assert summary["p95_us"] >= summary["p80_us"]
+    assert payload["v1"]["histogram"]
+
+
+def test_json_trace_has_tracks_and_phase_summary(v1_result, v2_result):
+    deltas = sort_deltas(compute_all_deltas(v1_result.metrics, v2_result.metrics))
+    verdict = compute_verdict(v1_result, v2_result)
+    payload = build_json_payload(
+        hardware=v1_result.hardware,
+        kernel_name=v1_result.kernel_name,
+        file_a="v1.cu",
+        file_b="v2.cu",
+        actual_runs=20,
+        max_runs=50,
+        min_runs=10,
+        noise_threshold=1.0,
+        warmup=32,
+        l2_flush=False,
+        verdict=verdict,
+        deltas=deltas,
+        roofline=RooflineResult("memory", 0.72, 0.89, 11.0, True),
+        ptx_diff=[],
+        warnings=[],
+        v1_profile=v1_result,
+        v2_profile=v2_result,
+    )
+    trace = payload["trace"]
+    assert trace["schema"] == "kerndiff_host_trace_v1"
+    assert trace["tracks"]
+    assert any(event["name"] == "timed_runs" for event in trace["events"])
+    assert any(item["name"] == "warmup" for item in trace["phase_summary"])
+
+
+def test_render_perfetto_trace_includes_metadata_and_events(v1_result, v2_result):
+    deltas = sort_deltas(compute_all_deltas(v1_result.metrics, v2_result.metrics))
+    verdict = compute_verdict(v1_result, v2_result)
+    payload = build_json_payload(
+        hardware=v1_result.hardware,
+        kernel_name=v1_result.kernel_name,
+        file_a="v1.cu",
+        file_b="v2.cu",
+        actual_runs=20,
+        max_runs=50,
+        min_runs=10,
+        noise_threshold=1.0,
+        warmup=32,
+        l2_flush=False,
+        verdict=verdict,
+        deltas=deltas,
+        roofline=RooflineResult("memory", 0.72, 0.89, 11.0, True),
+        ptx_diff=[],
+        warnings=[],
+        v1_profile=v1_result,
+        v2_profile=v2_result,
+    )
+    trace = json.loads(render_perfetto_trace(payload))
+    names = [event["name"] for event in trace["traceEvents"]]
+    assert "thread_name" in names
+    assert "timed_runs" in names
+    assert "run_001" in names
 
 
 def test_output_file_writes_and_stdout_empty(tmp_path):

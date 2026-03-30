@@ -19,7 +19,7 @@ from kerndiff.profiler import MOCK_HARDWARE, lock_clocks, profile, query_hardwar
 from kerndiff import ptx
 from kerndiff.renderer import (
     build_json_payload, render_json, render_metric_table, render_ptx_diff,
-    render_verdict, render_shape_table, write_output,
+    render_perfetto_trace, render_verdict, render_shape_table, write_output,
 )
 from kerndiff.roofline import compute_roofline
 
@@ -250,6 +250,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="export_json",
         metavar="FILE",
         help="write JSON output to FILE (implies --format json). Progress still shown on stderr.",
+    )
+    parser.add_argument(
+        "--export-perfetto",
+        dest="export_perfetto",
+        metavar="FILE",
+        help="write a Perfetto/Chrome trace JSON file for host-side profiling phases and timing samples",
     )
     parser.add_argument("--ptx", action="store_true", help="show PTX instruction diff (hidden by default)")
     parser.add_argument("--mock", action="store_true")
@@ -559,30 +565,34 @@ def _run_single_kernel(
     clocks_locked = hardware.clocks_locked
     noise_ceiling = max(result_a.cv_pct, result_b.cv_pct) * 2.0 if not clocks_locked else 0.0
 
+    payload = build_json_payload(
+        hardware=hardware,
+        kernel_name=kernel_name,
+        file_a=file_a,
+        file_b=file_b,
+        actual_runs=max(result_a.actual_runs, result_b.actual_runs),
+        max_runs=args.max_runs,
+        min_runs=args.min_runs,
+        noise_threshold=args.noise_threshold,
+        warmup=args.warmup,
+        buf_elems=elems,
+        l2_flush=result_a.l2_flush or result_b.l2_flush,
+        verdict=verdict,
+        deltas=deltas,
+        roofline=roofline,
+        roofline_v1_bw=roofline_v1.bw_utilization,
+        ptx_diff=ptx_diff,
+        warnings=aggregate_warnings,
+        total_hbm=total_hbm,
+        pipeline=pipeline,
+        v1_profile=result_a,
+        v2_profile=result_b,
+    )
+
+    if getattr(args, "export_perfetto", None):
+        write_output(render_perfetto_trace(payload), args.export_perfetto)
+
     if args.format == "json":
-        payload = build_json_payload(
-            hardware=hardware,
-            kernel_name=kernel_name,
-            file_a=file_a,
-            file_b=file_b,
-            actual_runs=max(result_a.actual_runs, result_b.actual_runs),
-            max_runs=args.max_runs,
-            min_runs=args.min_runs,
-            noise_threshold=args.noise_threshold,
-            warmup=args.warmup,
-            buf_elems=elems,
-            l2_flush=result_a.l2_flush or result_b.l2_flush,
-            verdict=verdict,
-            deltas=deltas,
-            roofline=roofline,
-            roofline_v1_bw=roofline_v1.bw_utilization,
-            ptx_diff=ptx_diff,
-            warnings=aggregate_warnings,
-            total_hbm=total_hbm,
-            pipeline=pipeline,
-            v1_profile=result_a,
-            v2_profile=result_b,
-        )
         return render_json(payload)
     else:
         sections = [
@@ -767,7 +777,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.fn_name and args.all_kernels:
             raise SystemExit("error: --fn and --all are mutually exclusive")
-
+        if args.export_perfetto and args.all_kernels:
+            raise SystemExit("error: --export-perfetto does not support --all")
         if args.pipeline > 1 and not args.call_expr:
             raise SystemExit("error: --pipeline requires --call")
 
@@ -797,7 +808,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise SystemExit("error: --shape values must be positive integers (e.g. 1024,2048,4096)")
             if any(s <= 0 for s in shapes):
                 raise SystemExit("error: --shape values must be > 0")
-
+            if args.export_perfetto:
+                raise SystemExit("error: --export-perfetto does not support --shape")
         if args.watch:
             return _watch_loop(args, argv)
 
@@ -892,6 +904,11 @@ def _run_main(args, file_a, file_b, use_color, aggregate_warnings, shapes, confi
             locked = False
         hardware.clocks_locked = locked
         if locked:
+            refreshed = query_hardware(gpu_id=physical_gpu_id)
+            if refreshed.gpu_name != "unknown":
+                refreshed.clocks_locked = True
+                refreshed.mock = hardware.mock
+                hardware = refreshed
             _emit_status("locking clocks...", "ok")
         else:
             noise_floor = NOISE_FLOOR_UNLOCKED

@@ -5,6 +5,7 @@ import random
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import mean, median, stdev
@@ -69,6 +70,8 @@ class ProfileResult:
     warmup: int
     l2_flush: bool
     output_vals: list[float] = field(default_factory=list)
+    trace_events: list[dict] = field(default_factory=list)
+    clock_telemetry: dict[str, object] = field(default_factory=dict)
 
 
 def query_hardware(gpu_id: int) -> HardwareInfo:
@@ -104,11 +107,14 @@ def query_l2_size(gpu_id: int, gpu_name: str = "") -> int:
         if name.lower() in gpu_name.lower():
             return size
     # Fall back to nvidia-smi
-    result = subprocess.run(
-        ["nvidia-smi", "--query-gpu=l2_cache", "--format=csv,noheader,nounits", "-i", str(gpu_id)],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=l2_cache", "--format=csv,noheader,nounits", "-i", str(gpu_id)],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return 6 * 1024 * 1024
     if result.returncode != 0 or not result.stdout.strip():
         return 6 * 1024 * 1024  # 6MB safe fallback
     try:
@@ -162,6 +168,54 @@ def query_peak_bandwidth_nvml(gpu_id: int) -> float | None:
         return peak_bw if peak_bw > 0 else None
     except Exception:
         return None
+
+
+def _decode_throttle_reasons(pynvml, reasons: int) -> list[str]:
+    known_reasons = [
+        ("gpu_idle", getattr(pynvml, "nvmlClocksThrottleReasonGpuIdle", 0)),
+        ("applications_clocks", getattr(pynvml, "nvmlClocksThrottleReasonApplicationsClocksSetting", 0)),
+        ("sw_power_cap", getattr(pynvml, "nvmlClocksThrottleReasonSwPowerCap", 0)),
+        ("hw_slowdown", getattr(pynvml, "nvmlClocksThrottleReasonHwSlowdown", 0)),
+        ("hw_thermal_slowdown", getattr(pynvml, "nvmlClocksThrottleReasonHwThermalSlowdown", 0)),
+        ("sw_thermal_slowdown", getattr(pynvml, "nvmlClocksThrottleReasonSwThermalSlowdown", 0)),
+        ("sync_boost", getattr(pynvml, "nvmlClocksThrottleReasonSyncBoost", 0)),
+        ("display_clock_setting", getattr(pynvml, "nvmlClocksThrottleReasonDisplayClockSetting", 0)),
+    ]
+    active = [name for name, mask in known_reasons if mask and (reasons & mask)]
+    return active
+
+
+def query_clock_telemetry(gpu_id: int, hardware: HardwareInfo | None = None) -> dict[str, object]:
+    fallback = {
+        "current_sm_clock_mhz": hardware.sm_clock_mhz if hardware else 0,
+        "current_mem_clock_mhz": hardware.mem_clock_mhz if hardware else 0,
+        "max_sm_clock_mhz": 0,
+        "max_mem_clock_mhz": 0,
+        "throttle_reasons": [],
+    }
+    try:
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.filterwarnings("ignore", category=FutureWarning)
+            import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+        current_sm = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM)
+        current_mem = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)
+        max_sm = pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_SM)
+        max_mem = pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_MEM)
+        throttle_bits = pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(handle)
+        pynvml.nvmlShutdown()
+        return {
+            "current_sm_clock_mhz": current_sm,
+            "current_mem_clock_mhz": current_mem,
+            "max_sm_clock_mhz": max_sm,
+            "max_mem_clock_mhz": max_mem,
+            "throttle_reasons": _decode_throttle_reasons(pynvml, throttle_bits),
+        }
+    except Exception:
+        return fallback
 
 
 def lock_clocks(gpu_id: int) -> bool:
@@ -249,6 +303,41 @@ def _synthesize_latencies(min_latency_us: float, runs: int) -> list[float]:
     return latencies
 
 
+def _trace_event(
+    *,
+    lane: str,
+    name: str,
+    category: str,
+    ts_us: float,
+    dur_us: float,
+    args: dict | None = None,
+) -> dict:
+    return {
+        "lane": lane,
+        "name": name,
+        "category": category,
+        "ts_us": ts_us,
+        "dur_us": max(dur_us, 0.0),
+        "args": args or {},
+    }
+
+
+def _sample_trace_events(latencies_us: list[float], start_ts_us: float) -> list[dict]:
+    events: list[dict] = []
+    cursor_us = start_ts_us
+    for idx, latency_us in enumerate(latencies_us, start=1):
+        events.append(_trace_event(
+            lane="samples",
+            name=f"run_{idx:03d}",
+            category="timing_sample",
+            ts_us=cursor_us,
+            dur_us=latency_us,
+            args={"latency_us": latency_us, "run_index": idx},
+        ))
+        cursor_us += latency_us
+    return events
+
+
 def profile(
     binary: str,
     kernel_name: str,
@@ -268,6 +357,8 @@ def profile(
     progress_label: str = "",
 ) -> ProfileResult:
     warnings: list[str] = []
+    trace_events: list[dict] = []
+    clock_telemetry: dict[str, object] = {}
 
     if mock:
         fixture_path = Path(__file__).resolve().parent / "fixtures" / f"{mock_prefix}_ncu.csv"
@@ -277,6 +368,16 @@ def profile(
         cv_pct = _compute_cv(all_latencies_us)
         metrics["latency_us"] = min_latency_us
         metrics.update(compute_derived_metrics(metrics))
+        timed_total_us = sum(all_latencies_us)
+        trace_events.append(_trace_event(
+            lane="phases",
+            name="timed_runs",
+            category="profile_phase",
+            ts_us=0.0,
+            dur_us=timed_total_us,
+            args={"runs": len(all_latencies_us), "pipeline": pipeline, "mock": True},
+        ))
+        trace_events.extend(_sample_trace_events(all_latencies_us, 0.0))
         return ProfileResult(
             kernel_name=kernel_name,
             metrics=metrics,
@@ -297,6 +398,8 @@ def profile(
             noise_threshold=1.0,
             warmup=warmup,
             l2_flush=False,
+            trace_events=trace_events,
+            clock_telemetry=query_clock_telemetry(gpu_id, MOCK_HARDWARE),
         )
 
     run_env = os.environ.copy()
@@ -305,8 +408,19 @@ def profile(
 
     l2_size_bytes = query_l2_size(gpu_id, gpu_name=hardware.gpu_name)
 
+    warmup_start = time.perf_counter_ns()
     if backend is not None:
         _run_warmup_backend(backend, binary, kernel_name, warmup, run_env)
+        warmup_dur_us = (time.perf_counter_ns() - warmup_start) / 1000.0
+        trace_events.append(_trace_event(
+            lane="phases",
+            name="warmup",
+            category="profile_phase",
+            ts_us=0.0,
+            dur_us=warmup_dur_us,
+            args={"iters": warmup},
+        ))
+        timed_start = time.perf_counter_ns()
         latencies, output_vals = _run_timed_backend(
             backend, binary, kernel_name, l2_size_bytes,
             min_runs, max_runs, noise_threshold, warmup, run_env,
@@ -314,14 +428,47 @@ def profile(
             show_progress=show_progress,
             progress_label=progress_label,
         )
+        timed_dur_us = (time.perf_counter_ns() - timed_start) / 1000.0
     else:
         output_vals: list[float] = []
         _run_warmup_legacy(binary, kernel_name, warmup, run_env)
+        warmup_dur_us = (time.perf_counter_ns() - warmup_start) / 1000.0
+        trace_events.append(_trace_event(
+            lane="phases",
+            name="warmup",
+            category="profile_phase",
+            ts_us=0.0,
+            dur_us=warmup_dur_us,
+            args={"iters": warmup},
+        ))
+        timed_start = time.perf_counter_ns()
         latencies = _run_timed_legacy(
             binary, kernel_name, l2_size_bytes,
             min_runs, max_runs, noise_threshold, run_env,
             show_progress=show_progress,
             progress_label=progress_label,
+        )
+        timed_dur_us = (time.perf_counter_ns() - timed_start) / 1000.0
+
+    trace_events.append(_trace_event(
+        lane="phases",
+        name="timed_runs",
+        category="profile_phase",
+        ts_us=warmup_dur_us,
+        dur_us=timed_dur_us,
+        args={"runs": len(latencies), "pipeline": pipeline},
+    ))
+    trace_events.extend(_sample_trace_events(latencies, warmup_dur_us))
+    clock_telemetry = query_clock_telemetry(gpu_id, hardware)
+    active_throttle_reasons = [
+        reason
+        for reason in clock_telemetry.get("throttle_reasons", [])
+        if reason not in {"applications_clocks", "gpu_idle"}
+    ]
+    if active_throttle_reasons:
+        warnings.append(
+            "GPU reported active clock-throttle reasons during timing: "
+            + ", ".join(active_throttle_reasons)
         )
 
     if not latencies:
@@ -371,6 +518,7 @@ def profile(
         metrics: dict[str, float] = {}
     else:
         ncu_metric_names = ",".join(METRICS_BY_NCU.keys())
+        ncu_start = time.perf_counter_ns()
 
         if backend is not None:
             # Triton: use single-run NCU harness (persistent harness can't be used by NCU)
@@ -437,6 +585,15 @@ def profile(
                 metrics = parse_ncu_csv_pipeline(ncu_result.stdout, pipeline)
             else:
                 metrics = parse_ncu_csv(ncu_result.stdout)
+        ncu_dur_us = (time.perf_counter_ns() - ncu_start) / 1000.0
+        trace_events.append(_trace_event(
+            lane="phases",
+            name="ncu",
+            category="profile_phase",
+            ts_us=warmup_dur_us + timed_dur_us,
+            dur_us=ncu_dur_us,
+            args={"metrics_collected": len(metrics), "pipeline": pipeline},
+        ))
 
     metrics["latency_us"] = min_latency_us
     metrics.update(compute_derived_metrics(metrics))
@@ -462,6 +619,8 @@ def profile(
         warmup=warmup,
         l2_flush=True,
         output_vals=output_vals,
+        trace_events=trace_events,
+        clock_telemetry=clock_telemetry,
     )
 
 

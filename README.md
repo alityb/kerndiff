@@ -59,6 +59,12 @@ Write JSON to file while keeping stderr progress:
 kerndiff a.cu b.cu --fn k --export-json result.json
 ```
 
+Write a Perfetto-compatible host trace:
+
+```bash
+kerndiff a.cu b.cu --fn k --export-perfetto trace.json
+```
+
 ## Key options
 
 - `--fn NAME`: kernel name
@@ -72,6 +78,7 @@ kerndiff a.cu b.cu --fn k --export-json result.json
 - `--format {term,json}`: output format
 - `--output FILE`: write output to file
 - `--export-json FILE`: write JSON file and keep stderr progress
+- `--export-perfetto FILE`: write a Perfetto/Chrome trace JSON file for host phases and timing samples
 - `--no-color`: disable ANSI colors
 - `--gpu N`: GPU index
 - `--arch sm_XX`: target SM architecture

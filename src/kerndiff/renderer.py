@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from statistics import mean
 from pathlib import Path
 
 from kerndiff.diff import MetricDelta
@@ -241,6 +242,139 @@ def render_ptx_diff(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+    s = sorted(values)
+    pos = (len(s) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(s) - 1)
+    frac = pos - lo
+    return s[lo] * (1.0 - frac) + s[hi] * frac
+
+
+def _build_histogram(values: list[float], bins: int = 12) -> list[dict[str, float | int]]:
+    if not values:
+        return []
+    lo = min(values)
+    hi = max(values)
+    if hi <= lo:
+        return [{"start_us": lo, "end_us": hi, "count": len(values)}]
+
+    bucket_count = max(1, min(bins, len(values)))
+    width = (hi - lo) / bucket_count
+    counts = [0 for _ in range(bucket_count)]
+    for value in values:
+        idx = min(int((value - lo) / width), bucket_count - 1)
+        counts[idx] += 1
+
+    histogram: list[dict[str, float | int]] = []
+    for idx, count in enumerate(counts):
+        start = lo + idx * width
+        end = hi if idx == bucket_count - 1 else start + width
+        histogram.append({"start_us": start, "end_us": end, "count": count})
+    return histogram
+
+
+def _build_latency_summary(profile: ProfileResult | None) -> dict:
+    if profile is None:
+        return {
+            "runs": 0,
+            "clean_runs": 0,
+            "mean_us": 0.0,
+            "min_us": 0.0,
+            "p20_us": 0.0,
+            "p50_us": 0.0,
+            "p80_us": 0.0,
+            "p95_us": 0.0,
+            "max_us": 0.0,
+            "cv_pct": 0.0,
+            "outliers": 0,
+        }
+
+    values = profile.clean_latencies_us or profile.all_latencies_us
+    return {
+        "runs": len(profile.all_latencies_us),
+        "clean_runs": len(values),
+        "mean_us": mean(values) if values else 0.0,
+        "min_us": min(values) if values else 0.0,
+        "p20_us": _percentile(values, 0.2),
+        "p50_us": _percentile(values, 0.5),
+        "p80_us": _percentile(values, 0.8),
+        "p95_us": _percentile(values, 0.95),
+        "max_us": max(values) if values else 0.0,
+        "cv_pct": profile.cv_pct,
+        "outliers": profile.n_outliers,
+    }
+
+
+def _profile_trace_duration(profile: ProfileResult | None) -> float:
+    if profile is None or not profile.trace_events:
+        return 0.0
+    return max((event["ts_us"] + event["dur_us"]) for event in profile.trace_events)
+
+
+def _build_trace_artifact(
+    v1_profile: ProfileResult | None,
+    v2_profile: ProfileResult | None,
+    gap_us: float = 1000.0,
+) -> dict:
+    tracks: list[dict] = []
+    events: list[dict] = []
+    phase_summary: list[dict] = []
+    offset_us = 0.0
+
+    for variant, profile in (("v1", v1_profile), ("v2", v2_profile)):
+        if profile is None:
+            continue
+        track_names: dict[str, str] = {}
+        for event in profile.trace_events:
+            lane = event["lane"]
+            if lane not in track_names:
+                track_name = f"{variant} {lane}"
+                track_id = f"{variant}:{lane}"
+                track_names[lane] = track_id
+                tracks.append({
+                    "id": track_id,
+                    "name": track_name,
+                    "variant": variant,
+                    "lane": lane,
+                })
+
+            ts_us = offset_us + event["ts_us"]
+            dur_us = event["dur_us"]
+            events.append({
+                "name": event["name"],
+                "category": event["category"],
+                "variant": variant,
+                "lane": lane,
+                "track_id": track_names[lane],
+                "track_name": f"{variant} {lane}",
+                "ts_us": ts_us,
+                "dur_us": dur_us,
+                "args": event.get("args", {}),
+            })
+            if lane == "phases":
+                phase_summary.append({
+                    "variant": variant,
+                    "name": event["name"],
+                    "dur_us": dur_us,
+                    "args": event.get("args", {}),
+                })
+
+        offset_us += _profile_trace_duration(profile) + gap_us
+
+    return {
+        "schema": "kerndiff_host_trace_v1",
+        "clock": "relative_us",
+        "tracks": tracks,
+        "events": events,
+        "phase_summary": phase_summary,
+    }
+
+
 def build_json_payload(
     *,
     hardware,
@@ -280,12 +414,18 @@ def build_json_payload(
             "latencies_us": v1_profile.all_latencies_us if v1_profile else [],
             "clean_latencies_us": v1_profile.clean_latencies_us if v1_profile else [],
             "n_outliers": v1_profile.n_outliers if v1_profile else 0,
+            "summary": _build_latency_summary(v1_profile),
+            "histogram": _build_histogram(v1_profile.clean_latencies_us if v1_profile else []),
+            "clock_telemetry": v1_profile.clock_telemetry if v1_profile else {},
         },
         "v2": {
             "file": file_b,
             "latencies_us": v2_profile.all_latencies_us if v2_profile else [],
             "clean_latencies_us": v2_profile.clean_latencies_us if v2_profile else [],
             "n_outliers": v2_profile.n_outliers if v2_profile else 0,
+            "summary": _build_latency_summary(v2_profile),
+            "histogram": _build_histogram(v2_profile.clean_latencies_us if v2_profile else []),
+            "clock_telemetry": v2_profile.clock_telemetry if v2_profile else {},
         },
         "actual_runs": actual_runs,
         "max_runs": max_runs,
@@ -319,6 +459,7 @@ def build_json_payload(
             "note": "static instruction count — not dynamic execution count",
             "instructions": ptx_diff,
         },
+        "trace": _build_trace_artifact(v1_profile, v2_profile),
         "warnings": warnings,
     }
     if roofline and roofline.gpu_matched:
@@ -360,3 +501,43 @@ def render_shape_table(rows: list[dict]) -> str:
 
 def render_json(payload: dict) -> str:
     return json.dumps(payload, indent=2)
+
+
+def render_perfetto_trace(payload: dict) -> str:
+    trace = payload.get("trace", {})
+    tracks = trace.get("tracks", [])
+    events = trace.get("events", [])
+
+    trace_events: list[dict] = []
+    pid = 1
+    track_tid: dict[str, int] = {}
+
+    for idx, track in enumerate(tracks, start=1):
+        track_tid[track["id"]] = idx
+        trace_events.append({
+            "name": "thread_name",
+            "ph": "M",
+            "pid": pid,
+            "tid": idx,
+            "args": {"name": track["name"]},
+        })
+
+    for event in events:
+        trace_events.append({
+            "name": event["name"],
+            "cat": event["category"],
+            "ph": "X",
+            "pid": pid,
+            "tid": track_tid.get(event["track_id"], 0),
+            "ts": round(event["ts_us"], 3),
+            "dur": round(event["dur_us"], 3),
+            "args": {
+                "variant": event.get("variant"),
+                **event.get("args", {}),
+            },
+        })
+
+    return json.dumps({
+        "displayTimeUnit": "us",
+        "traceEvents": trace_events,
+    }, indent=2)

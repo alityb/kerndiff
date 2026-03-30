@@ -57,6 +57,32 @@ def make_result(latency_us=247.0, overrides=None):
         noise_threshold=1.0,
         warmup=32,
         l2_flush=False,
+        trace_events=[
+            {
+                "lane": "phases",
+                "name": "warmup",
+                "category": "profile_phase",
+                "ts_us": 0.0,
+                "dur_us": 40.0,
+                "args": {"iters": 32},
+            },
+            {
+                "lane": "phases",
+                "name": "timed_runs",
+                "category": "profile_phase",
+                "ts_us": 40.0,
+                "dur_us": sum(lats),
+                "args": {"runs": len(lats), "pipeline": 1},
+            },
+            {
+                "lane": "samples",
+                "name": "run_001",
+                "category": "timing_sample",
+                "ts_us": 40.0,
+                "dur_us": lats[0],
+                "args": {"latency_us": lats[0], "run_index": 1},
+            },
+        ],
     )
 
 

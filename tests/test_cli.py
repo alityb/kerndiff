@@ -1,4 +1,5 @@
 import io
+import json
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -360,3 +361,26 @@ def test_export_json_implies_json_file_and_keeps_stderr(tmp_path):
     assert stdout.getvalue() == ""
     assert out_file.exists()
     assert "gpu: NVIDIA H100 SXM5 80GB (mock)" in stderr.getvalue()
+
+
+def test_export_perfetto_writes_trace_and_keeps_stdout(tmp_path):
+    out_file = tmp_path / "trace.json"
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        rc = main([
+            "--mock", "v1.cu", "v2.cu", "--fn", "k",
+            "--export-perfetto", str(out_file),
+        ])
+    assert rc == 0
+    trace = json.loads(out_file.read_text())
+    names = [event["name"] for event in trace["traceEvents"]]
+    assert "thread_name" in names
+    assert "timed_runs" in names
+    assert "latency" in stdout.getvalue().lower()
+
+
+def test_export_perfetto_rejects_all_mode():
+    with pytest.raises(SystemExit) as exc:
+        main(["--mock", "v1.cu", "v2.cu", "--all", "--export-perfetto", "trace.json"])
+    assert "--export-perfetto does not support --all" in str(exc.value)

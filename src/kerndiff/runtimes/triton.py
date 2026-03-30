@@ -55,7 +55,10 @@ class TritonBackend:
     """Backend for .py Triton files — generates a persistent Python harness."""
 
     def __init__(self):
-        _check_triton()
+        # Harness generation and command construction do not require Triton to
+        # be importable in the current Python process. Runtime execution will
+        # fail later with the harness stderr if Triton is actually unavailable.
+        pass
 
     # ------------------------------------------------------------------
     # Harness generation
