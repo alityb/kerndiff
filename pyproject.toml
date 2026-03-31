@@ -4,9 +4,36 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kerndiff"
-version = "0.1.0"
+dynamic = ["version"]
+description = "Compare CUDA and Triton kernels with latency, Nsight Compute metrics, PTX diffs, and roofline summaries."
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
+license = { file = "LICENSE" }
+authors = [
+  { name = "Ali Tayeb", email = "ali.moh.islam.1@gmail.com" },
+]
+keywords = ["cuda", "triton", "gpu", "profiling", "kernels", "benchmark"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Software Development :: Testing",
+  "Topic :: System :: Benchmark",
+]
+
+[project.urls]
+Homepage = "https://github.com/alityb/kerndiff"
+Repository = "https://github.com/alityb/kerndiff"
+Issues = "https://github.com/alityb/kerndiff/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
@@ -22,6 +49,10 @@ include = [
   "src/kerndiff",
   "tests",
   "examples",
+  "LICENSE",
   "README.md",
   "pyproject.toml",
 ]
+
+[tool.hatch.version]
+path = "src/kerndiff/__init__.py"

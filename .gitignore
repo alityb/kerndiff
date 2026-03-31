@@ -1,2 +1,5 @@
-CLAUDE.md 
+CLAUDE.md
 __pycache__/
+.claude/
+IDEAS.md
+dist/

@@ -11,9 +11,25 @@ It is designed for practical iteration: change a kernel, run one command, and se
 
 ## Install
 
+Published package:
+
+```bash
+pip install kerndiff
+```
+
+Development install:
+
 ```bash
 pip install -e .
 ```
+
+Runtime prerequisites:
+- NVIDIA drivers and a supported GPU for real profiling
+- `nvcc` for CUDA kernel compilation
+- `ncu` (Nsight Compute) for hardware counters
+
+License:
+- MIT, see `LICENSE`
 
 ## Quickstart
 
@@ -118,6 +134,18 @@ Run tests:
 ```bash
 python -m pytest tests/ -q
 ```
+
+## Release
+
+Bump `src/kerndiff/__init__.py`, build locally, and verify the distributions:
+
+```bash
+python3 -m pip install --upgrade build twine
+python3 -m build
+python3 -m twine check dist/*
+```
+
+Publishing is automated by `.github/workflows/publish.yml` when a GitHub Release is published.
 
 ## Troubleshooting
 
