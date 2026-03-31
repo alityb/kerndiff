@@ -29,6 +29,7 @@ def test_fn_auto_detect_single_matching_kernel(tmp_path):
         rc = main(["--mock", str(file_a), str(file_b)])
     assert rc == 0
     assert "could not auto-detect" not in stderr.getvalue()
+    assert "auto-selected kernel 'chunked_scan_kernel'" in stdout.getvalue()
 
 
 def test_fn_auto_detect_error_lists_kernels(tmp_path):

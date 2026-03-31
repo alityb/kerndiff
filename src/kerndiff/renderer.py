@@ -320,6 +320,32 @@ def _build_latency_summary(profile: ProfileResult | None) -> dict:
     }
 
 
+def _has_hardware_counters(profile: ProfileResult | None) -> bool:
+    if profile is None:
+        return False
+    return any(key != "latency_us" for key in profile.metrics)
+
+
+def _build_instrumentation_status(profile: ProfileResult | None) -> dict:
+    if profile is None:
+        return {
+            "ncu_metrics_available": False,
+            "ptx_available": False,
+            "clock_telemetry_available": False,
+            "clock_telemetry_source": "missing",
+            "latency_only": True,
+        }
+    telemetry = profile.clock_telemetry or {}
+    has_counters = _has_hardware_counters(profile)
+    return {
+        "ncu_metrics_available": has_counters,
+        "ptx_available": bool(profile.ptx_instructions),
+        "clock_telemetry_available": bool(telemetry.get("available", False)),
+        "clock_telemetry_source": telemetry.get("source", "missing"),
+        "latency_only": not has_counters,
+    }
+
+
 def _profile_trace_duration(profile: ProfileResult | None) -> float:
     if profile is None or not profile.trace_events:
         return 0.0
@@ -426,6 +452,7 @@ def build_json_payload(
             "n_outliers": v1_profile.n_outliers if v1_profile else 0,
             "summary": _build_latency_summary(v1_profile),
             "histogram": _build_histogram(v1_profile.clean_latencies_us if v1_profile else []),
+            "instrumentation": _build_instrumentation_status(v1_profile),
             "clock_telemetry": v1_profile.clock_telemetry if v1_profile else {},
         },
         "v2": {
@@ -435,6 +462,7 @@ def build_json_payload(
             "n_outliers": v2_profile.n_outliers if v2_profile else 0,
             "summary": _build_latency_summary(v2_profile),
             "histogram": _build_histogram(v2_profile.clean_latencies_us if v2_profile else []),
+            "instrumentation": _build_instrumentation_status(v2_profile),
             "clock_telemetry": v2_profile.clock_telemetry if v2_profile else {},
         },
         "actual_runs": actual_runs,

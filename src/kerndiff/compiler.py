@@ -139,6 +139,21 @@ def generate_call(fn_name: str, params: list[tuple[str, str]]) -> tuple[str, lis
     return call, warnings
 
 
+def infer_kernel_call(source_path: str, kernel_name: str) -> tuple[str, list[str], str]:
+    default_call = f"{kernel_name}<<<GRID_SIZE, BLOCK_SIZE>>>(d_a, d_b, d_c, N)"
+    try:
+        source = Path(source_path).read_text()
+    except OSError:
+        return default_call, ["could not read source"], "default"
+
+    params = parse_kernel_signature(source, kernel_name)
+    if not params:
+        return default_call, ["could not parse kernel signature"], "default"
+
+    call, warnings = generate_call(kernel_name, params)
+    return call, warnings, "inferred"
+
+
 def build_harness(source_path: str, kernel_name: str, kernel_call: str, dtype: str = "float", buf_elems: int = 1 << 22) -> str:
     temp_dir = tempfile.mkdtemp(prefix="kerndiff_build_")
     _TEMP_DIRS.append(temp_dir)
@@ -208,17 +223,8 @@ def compile_kernel(
     if kernel_call:
         call_expr = kernel_call
     else:
-        call_expr = f"{kernel_name}<<<GRID_SIZE, BLOCK_SIZE>>>(d_a, d_b, d_c, N)"
-        # Try auto-generating from signature
-        try:
-            source = Path(source_path).read_text()
-            params = parse_kernel_signature(source, kernel_name)
-            if params:
-                generated, _ = generate_call(kernel_name, params)
-                call_expr = generated
-                auto_call = generated
-        except Exception:
-            pass
+        call_expr, _, _ = infer_kernel_call(source_path, kernel_name)
+        auto_call = call_expr
     harness_path = build_harness(source_path, kernel_name, call_expr, dtype=dtype, buf_elems=buf_elems)
     output_path = str(Path(harness_path).with_suffix(""))
 

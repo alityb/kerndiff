@@ -187,11 +187,14 @@ def _decode_throttle_reasons(pynvml, reasons: int) -> list[str]:
 
 def query_clock_telemetry(gpu_id: int, hardware: HardwareInfo | None = None) -> dict[str, object]:
     fallback = {
+        "available": False,
+        "source": "fallback",
         "current_sm_clock_mhz": hardware.sm_clock_mhz if hardware else 0,
         "current_mem_clock_mhz": hardware.mem_clock_mhz if hardware else 0,
         "max_sm_clock_mhz": 0,
         "max_mem_clock_mhz": 0,
         "throttle_reasons": [],
+        "error": "NVML unavailable",
     }
     try:
         import warnings as _w
@@ -208,13 +211,17 @@ def query_clock_telemetry(gpu_id: int, hardware: HardwareInfo | None = None) -> 
         throttle_bits = pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(handle)
         pynvml.nvmlShutdown()
         return {
+            "available": True,
+            "source": "nvml",
             "current_sm_clock_mhz": current_sm,
             "current_mem_clock_mhz": current_mem,
             "max_sm_clock_mhz": max_sm,
             "max_mem_clock_mhz": max_mem,
             "throttle_reasons": _decode_throttle_reasons(pynvml, throttle_bits),
+            "error": "",
         }
-    except Exception:
+    except Exception as exc:
+        fallback["error"] = str(exc)
         return fallback
 
 
@@ -425,7 +432,12 @@ def profile(
             warmup=warmup,
             l2_flush=False,
             trace_events=trace_events,
-            clock_telemetry=query_clock_telemetry(gpu_id, MOCK_HARDWARE),
+            clock_telemetry={
+                **query_clock_telemetry(gpu_id, MOCK_HARDWARE),
+                "available": True,
+                "source": "mock",
+                "error": "",
+            },
         )
 
     run_env = os.environ.copy()
@@ -503,6 +515,10 @@ def profile(
     ))
     trace_events.extend(_sample_trace_events(latencies, warmup_dur_us))
     clock_telemetry = query_clock_telemetry(gpu_id, hardware)
+    if not clock_telemetry.get("available", False):
+        warnings.append(
+            "clock telemetry unavailable; throttle status and live clocks could not be verified."
+        )
     active_throttle_reasons = [
         reason
         for reason in clock_telemetry.get("throttle_reasons", [])

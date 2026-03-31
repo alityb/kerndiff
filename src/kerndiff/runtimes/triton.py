@@ -64,6 +64,9 @@ class TritonBackend:
     # Harness generation
     # ------------------------------------------------------------------
 
+    def default_call_expr(self, kernel_name: str, buf_elems: int) -> str:
+        return f"{kernel_name}[({buf_elems} + 127) // 128,](x, y, z, {buf_elems}, BLOCK_SIZE=128)"
+
     def _build_persistent_harness(
         self,
         source_path: str,
@@ -77,10 +80,7 @@ class TritonBackend:
         torch_dtype = TORCH_DTYPE_MAP.get(dtype, "torch.float32")
 
         if call_expr is None:
-            call_expr = (
-                f"{kernel_name}[({buf_elems} + 127) // 128,]"
-                f"(x, y, z, {buf_elems}, BLOCK_SIZE=128)"
-            )
+            call_expr = self.default_call_expr(kernel_name, buf_elems)
 
         source_text = Path(source_path).read_text()
         temp_dir = tempfile.mkdtemp(prefix="kerndiff_triton_")
@@ -164,10 +164,7 @@ class TritonBackend:
         torch_dtype = TORCH_DTYPE_MAP.get(dtype, "torch.float32")
 
         if call_expr is None:
-            call_expr = (
-                f"{kernel_name}[({buf_elems} + 127) // 128,]"
-                f"(x, y, z, {buf_elems}, BLOCK_SIZE=128)"
-            )
+            call_expr = self.default_call_expr(kernel_name, buf_elems)
 
         source_text = Path(source_path).read_text()
         temp_dir = tempfile.mkdtemp(prefix="kerndiff_triton_ncu_")

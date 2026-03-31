@@ -116,8 +116,10 @@ def test_json_has_required_keys(v1_result, v2_result):
     assert "n_outliers" in decoded["v1"]
     assert "summary" in decoded["v1"]
     assert "histogram" in decoded["v1"]
+    assert "instrumentation" in decoded["v1"]
     assert "clock_telemetry" in decoded["v1"]
     assert "trace" in decoded
+    assert decoded["v1"]["instrumentation"]["latency_only"] is True
 
 
 def test_json_latency_summary_has_percentiles(v1_result, v2_result):

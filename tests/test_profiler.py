@@ -124,6 +124,37 @@ def test_profile_warns_when_throttle_reasons_active(monkeypatch):
     assert any("clock-throttle reasons" in w for w in result.warnings)
 
 
+def test_profile_warns_when_clock_telemetry_unavailable(monkeypatch):
+    monkeypatch.setattr("kerndiff.profiler.query_l2_size", lambda gpu_id, gpu_name="": 6 * 1024 * 1024)
+    monkeypatch.setattr("kerndiff.profiler.query_clock_telemetry", lambda gpu_id, hardware=None: {
+        "available": False,
+        "source": "fallback",
+        "current_sm_clock_mhz": 0,
+        "current_mem_clock_mhz": 0,
+        "max_sm_clock_mhz": 0,
+        "max_mem_clock_mhz": 0,
+        "throttle_reasons": [],
+        "error": "NVML unavailable",
+    })
+    monkeypatch.setattr("kerndiff.profiler._run_warmup_legacy", lambda *args, **kwargs: None)
+    monkeypatch.setattr("kerndiff.profiler._run_timed_legacy", lambda *args, **kwargs: [100.0] * 5)
+    monkeypatch.setattr("kerndiff.profiler._find_ncu", lambda: None)
+
+    result = profile(
+        binary="/tmp/fake_bin",
+        kernel_name="k",
+        max_runs=10,
+        min_runs=5,
+        noise_threshold=0.0,
+        warmup=0,
+        gpu_id=0,
+        hardware=MOCK_HARDWARE,
+        mock=False,
+    )
+    assert result.clock_telemetry["available"] is False
+    assert any("clock telemetry unavailable" in w for w in result.warnings)
+
+
 def test_profile_uses_pre_collected_latencies(monkeypatch):
     """When pre_collected_latencies is passed, warmup and timing loop must be skipped."""
     monkeypatch.setattr("kerndiff.profiler.query_l2_size", lambda gpu_id, gpu_name="": 6 * 1024 * 1024)

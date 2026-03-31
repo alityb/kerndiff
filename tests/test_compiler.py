@@ -3,6 +3,7 @@ from kerndiff.compiler import (
     DTYPE_MAP,
     build_harness,
     generate_call,
+    infer_kernel_call,
     parse_kernel_signature,
     verify_correctness,
 )
@@ -90,6 +91,24 @@ def test_generate_call_extra_pointers():
     call, warnings = generate_call("kern", params)
     assert "nullptr" in call
     assert len(warnings) > 0
+
+
+def test_infer_kernel_call_reports_mode_and_warnings(tmp_path):
+    source = tmp_path / "kernel.cu"
+    source.write_text("__global__ void kern(float* a, float* b, float* c, float alpha) {}\n")
+    call, warnings, mode = infer_kernel_call(str(source), "kern")
+    assert mode == "inferred"
+    assert "GRID_SIZE" in call
+    assert any("alpha" in warning for warning in warnings)
+
+
+def test_infer_kernel_call_falls_back_when_signature_missing(tmp_path):
+    source = tmp_path / "kernel.cu"
+    source.write_text("// no matching kernel\n")
+    call, warnings, mode = infer_kernel_call(str(source), "kern")
+    assert mode == "default"
+    assert "d_a, d_b, d_c, N" in call
+    assert warnings == ["could not parse kernel signature"]
 
 
 def test_format_compile_error_shows_auto_call():
