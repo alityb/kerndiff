@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import statistics
 
 from kerndiff.metrics import METRICS, METRICS_BY_KEY, MetricDef
 
@@ -105,16 +106,70 @@ def compute_derived_metrics(metrics: dict) -> dict:
     if total_flops > 0 and latency_us > 0:
         derived["flops_tflops"] = total_flops / (latency_us * 1e-6) / 1e12
 
+    # SM imbalance proxy: ratio of sm_throughput to sm_occupancy.
+    # A value near 100% means every active warp contributes evenly.
+    # Low values suggest some SMs are idle while others are saturated.
+    sm_throughput = metrics.get("sm_throughput", 0.0)
+    sm_occupancy = metrics.get("sm_occupancy", 0.0)
+    if sm_throughput > 0 and sm_occupancy > 0:
+        derived["sm_imbalance"] = (sm_throughput / sm_occupancy) * 100.0
+
+    raw_sm_cycles = metrics.get("raw_sm_cycles", 0.0)
+    if raw_sm_cycles > 0 and latency_us > 0:
+        derived["actual_sm_mhz"] = raw_sm_cycles / (latency_us * 1e-6) / 1e6
+
     return derived
 
 
-def compute_verdict(v1: "ProfileResult", v2: "ProfileResult", noise_floor: float = NOISE_FLOOR_LOCKED) -> dict:
-    speedup = v1.min_latency_us / v2.min_latency_us if v2.min_latency_us else float("inf")
-    rel_err = math.sqrt((v1.cv_pct / 100.0) ** 2 + (v2.cv_pct / 100.0) ** 2)
-    speedup_uncertainty_x = speedup * rel_err
-    if abs(speedup - 1.0) < noise_floor:
+def _pairwise_stats(
+    latencies_a: list[float],
+    latencies_b: list[float],
+) -> tuple[float, float] | None:
+    """Return (median_speedup, uncertainty_x) from aligned paired latency lists.
+
+    Each pair (a_i, b_i) was measured back-to-back under the same GPU thermal
+    state, so common-mode noise cancels in the ratio.  The median of the ratios
+    is a robust point estimate of speedup; its sample stdev is the uncertainty.
+
+    Returns None when lists are mismatched or too short for statistics.
+    """
+    if len(latencies_a) != len(latencies_b) or len(latencies_a) < 2:
+        return None
+    ratios = [a / b for a, b in zip(latencies_a, latencies_b) if b > 0]
+    if len(ratios) < 2:
+        return None
+    return statistics.median(ratios), statistics.stdev(ratios)
+
+
+def compute_verdict(
+    v1: "ProfileResult",
+    v2: "ProfileResult",
+    noise_floor: float = NOISE_FLOOR_LOCKED,
+    paired_latencies_a: list[float] | None = None,
+    paired_latencies_b: list[float] | None = None,
+) -> dict:
+    paired = None
+    if paired_latencies_a and paired_latencies_b:
+        paired = _pairwise_stats(paired_latencies_a, paired_latencies_b)
+
+    if paired:
+        speedup, speedup_uncertainty_x = paired
+        # Floor at noise_floor so zero-variance inputs don't treat float rounding
+        # as a significant change, and to maintain a practical minimum threshold.
+        unchanged_threshold = max(speedup_uncertainty_x, noise_floor)
+        latency_delta_pct = (1.0 / speedup - 1.0) * 100.0 if speedup > 0 else 0.0
+        used_pairwise = True
+    else:
+        speedup = v1.min_latency_us / v2.min_latency_us if v2.min_latency_us else float("inf")
+        rel_err = math.sqrt((v1.cv_pct / 100.0) ** 2 + (v2.cv_pct / 100.0) ** 2)
+        speedup_uncertainty_x = speedup * rel_err
+        unchanged_threshold = noise_floor
+        latency_delta_pct = ((v2.min_latency_us - v1.min_latency_us) / (v1.min_latency_us or 1.0)) * 100.0
+        used_pairwise = False
+
+    if abs(speedup - 1.0) <= unchanged_threshold:
         direction = "unchanged"
-        label = f"no significant change"
+        label = "no significant change"
     elif speedup > 1.0:
         direction = "improvement"
         label = f"v2 is {speedup:.2f}x faster"
@@ -142,8 +197,9 @@ def compute_verdict(v1: "ProfileResult", v2: "ProfileResult", noise_floor: float
         "v2_p80_us": v2.p80_latency_us,
         "v2_n_outliers": v2.n_outliers,
         "speedup_uncertainty_x": speedup_uncertainty_x,
+        "paired_uncertainty": used_pairwise,
         "noise_floor_pct": noise_floor * 100.0,
-        "latency_delta_pct": ((v2.min_latency_us - v1.min_latency_us) / (v1.min_latency_us or 1.0)) * 100.0,
+        "latency_delta_pct": latency_delta_pct,
     }
 
 

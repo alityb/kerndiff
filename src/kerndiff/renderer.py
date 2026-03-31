@@ -94,7 +94,10 @@ def render_verdict(verdict: dict, use_color: bool = True, clocks_locked: bool = 
     line = f"  {label}{timing}{cv_note}"
     unc = verdict.get("speedup_uncertainty_x", 0.0)
     if unc >= 0.02:
-        line += _dim(f"  ±{unc:.2f}x", use_color)
+        unc_note = f"  ±{unc:.2f}x"
+        if verdict.get("paired_uncertainty"):
+            unc_note += " (paired)"
+        line += _dim(unc_note, use_color)
     if not clocks_locked:
         noise_ceil = max(v1_cv, v2_cv) * 2.0
         line += f"\n  note: clocks not locked — deltas below {noise_ceil:.0f}% may not be reliable"
@@ -144,6 +147,9 @@ def render_metric_table(
 
         rows.append((left, v1_text, v2_colored, v2_text, format_delta(delta), styled_symbol, delta.metric.group))
 
+    if not rows:
+        return ""
+
     name_w = max(18, *(len(row[0]) for row in rows))
     v1_w = max(12, *(len(row[1]) for row in rows))
     v2_w = max(12, *(len(row[3]) for row in rows))  # raw v2 for width
@@ -192,7 +198,9 @@ def render_metric_table(
         has_data = (v1_bw > 0 or v1_compute > 0 or v2_bw > 0 or v2_compute > 0)
         if has_data:
             lines.append(_dim(sep, use_color))
-            v1_bound = "memory" if v1_bw > v1_compute else "compute"
+            v1_bound = roofline_v1.bound if (roofline_v1 and roofline_v1.gpu_matched) else (
+                "memory" if v1_bw > v1_compute else "compute"
+            )
             v2_bound = roofline.bound
             if v1_bound != v2_bound:
                 bound_text = f"bound: {v1_bound[:3]}->{v2_bound[:3]}"
@@ -201,7 +209,9 @@ def render_metric_table(
             v1_text = f"v1: {v1_bw * 100:.0f}%bw" if v1_bound == "memory" else f"v1: {v1_compute * 100:.0f}%sm"
             v2_text = f"v2: {v2_bw * 100:.0f}%bw" if v2_bound == "memory" else f"v2: {v2_compute * 100:.0f}%sm"
             tail = f"{bound_text}  {roofline.headroom_pct:.0f}% headroom"
-            if getattr(roofline, "bw_source", "unknown") == "table":
+            if getattr(roofline, "used_tensor_core_peak", False):
+                tail += "  [fp16]"
+            elif getattr(roofline, "bw_source", "unknown") == "table":
                 tail += "  [spec]"
             lines.append(
                 f"  {lpad(_dim('roofline', use_color), 'roofline', name_w)}"
@@ -441,6 +451,7 @@ def build_json_payload(
             "v2_min_us", "v2_max_us", "v2_cv_pct",
             "v2_p20_us", "v2_p50_us", "v2_p80_us", "v2_n_outliers",
             "speedup_uncertainty_x",
+            "paired_uncertainty",
         ]},
         "deltas": [
             {
@@ -469,6 +480,8 @@ def build_json_payload(
             "v2_bw_utilization": roofline.bw_utilization,
             "headroom_pct": roofline.headroom_pct,
             "gpu_matched": roofline.gpu_matched,
+            "ridge_point": roofline.ridge_point,
+            "used_tensor_core_peak": roofline.used_tensor_core_peak,
         }
     if total_hbm is not None:
         payload["total_hbm"] = {"v1_gb": total_hbm[0], "v2_gb": total_hbm[1]}

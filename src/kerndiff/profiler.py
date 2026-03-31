@@ -338,6 +338,30 @@ def _sample_trace_events(latencies_us: list[float], start_ts_us: float) -> list[
     return events
 
 
+def _check_missing_metrics(metrics: dict[str, float], warnings: list[str]) -> None:
+    """Warn about visible NCU metrics that came back missing or zero.
+
+    A metric that NCU silently skips will appear as 0.0 (the dict default),
+    which is indistinguishable from a kernel that genuinely produces 0.
+    We can't know for sure, but metrics that are *always* zero on a given GPU
+    suggest the metric name isn't supported on that architecture/driver.
+    This function fires once per profile() call on the first run, so the user
+    gets an early signal rather than silently wrong diffs.
+    """
+    from kerndiff.metrics import METRICS
+    missing = [
+        m.key for m in METRICS
+        if not m.hidden and m.ncu_metric and m.key not in metrics
+    ]
+    if missing:
+        warnings.append(
+            f"NCU did not return {len(missing)} metric(s) — "
+            f"they may be unsupported on this GPU/driver: "
+            + ", ".join(missing[:5])
+            + (" ..." if len(missing) > 5 else "")
+        )
+
+
 def profile(
     binary: str,
     kernel_name: str,
@@ -355,6 +379,8 @@ def profile(
     dump_output: bool = False,
     show_progress: bool = False,
     progress_label: str = "",
+    pre_collected_latencies: list[float] | None = None,
+    run_timeout_sec: int = 0,
 ) -> ProfileResult:
     warnings: list[str] = []
     trace_events: list[dict] = []
@@ -408,47 +434,64 @@ def profile(
 
     l2_size_bytes = query_l2_size(gpu_id, gpu_name=hardware.gpu_name)
 
-    warmup_start = time.perf_counter_ns()
-    if backend is not None:
-        _run_warmup_backend(backend, binary, kernel_name, warmup, run_env)
-        warmup_dur_us = (time.perf_counter_ns() - warmup_start) / 1000.0
-        trace_events.append(_trace_event(
-            lane="phases",
-            name="warmup",
-            category="profile_phase",
-            ts_us=0.0,
-            dur_us=warmup_dur_us,
-            args={"iters": warmup},
-        ))
-        timed_start = time.perf_counter_ns()
-        latencies, output_vals = _run_timed_backend(
-            backend, binary, kernel_name, l2_size_bytes,
-            min_runs, max_runs, noise_threshold, warmup, run_env,
-            dump_output=dump_output,
-            show_progress=show_progress,
-            progress_label=progress_label,
-        )
-        timed_dur_us = (time.perf_counter_ns() - timed_start) / 1000.0
-    else:
+    if pre_collected_latencies is not None:
+        # Timing already done externally (e.g. interleave_timing). Skip warmup
+        # and timing loop entirely — go straight to NCU and statistics.
+        latencies = pre_collected_latencies
         output_vals: list[float] = []
-        _run_warmup_legacy(binary, kernel_name, warmup, run_env)
-        warmup_dur_us = (time.perf_counter_ns() - warmup_start) / 1000.0
+        warmup_dur_us = 0.0
+        timed_dur_us = 0.0
         trace_events.append(_trace_event(
             lane="phases",
-            name="warmup",
+            name="pre_collected_timing",
             category="profile_phase",
             ts_us=0.0,
-            dur_us=warmup_dur_us,
-            args={"iters": warmup},
+            dur_us=0.0,
+            args={"runs": len(latencies), "pre_collected": True},
         ))
-        timed_start = time.perf_counter_ns()
-        latencies = _run_timed_legacy(
-            binary, kernel_name, l2_size_bytes,
-            min_runs, max_runs, noise_threshold, run_env,
-            show_progress=show_progress,
-            progress_label=progress_label,
-        )
-        timed_dur_us = (time.perf_counter_ns() - timed_start) / 1000.0
+    else:
+        warmup_start = time.perf_counter_ns()
+        if backend is not None:
+            _run_warmup_backend(backend, binary, kernel_name, warmup, run_env)
+            warmup_dur_us = (time.perf_counter_ns() - warmup_start) / 1000.0
+            trace_events.append(_trace_event(
+                lane="phases",
+                name="warmup",
+                category="profile_phase",
+                ts_us=0.0,
+                dur_us=warmup_dur_us,
+                args={"iters": warmup},
+            ))
+            timed_start = time.perf_counter_ns()
+            latencies, output_vals = _run_timed_backend(
+                backend, binary, kernel_name, l2_size_bytes,
+                min_runs, max_runs, noise_threshold, warmup, run_env,
+                dump_output=dump_output,
+                show_progress=show_progress,
+                progress_label=progress_label,
+            )
+            timed_dur_us = (time.perf_counter_ns() - timed_start) / 1000.0
+        else:
+            output_vals: list[float] = []
+            _run_warmup_legacy(binary, kernel_name, warmup, run_env)
+            warmup_dur_us = (time.perf_counter_ns() - warmup_start) / 1000.0
+            trace_events.append(_trace_event(
+                lane="phases",
+                name="warmup",
+                category="profile_phase",
+                ts_us=0.0,
+                dur_us=warmup_dur_us,
+                args={"iters": warmup},
+            ))
+            timed_start = time.perf_counter_ns()
+            latencies = _run_timed_legacy(
+                binary, kernel_name, l2_size_bytes,
+                min_runs, max_runs, noise_threshold, run_env,
+                show_progress=show_progress,
+                progress_label=progress_label,
+                run_timeout_sec=run_timeout_sec,
+            )
+            timed_dur_us = (time.perf_counter_ns() - timed_start) / 1000.0
 
     trace_events.append(_trace_event(
         lane="phases",
@@ -585,6 +628,9 @@ def profile(
                 metrics = parse_ncu_csv_pipeline(ncu_result.stdout, pipeline)
             else:
                 metrics = parse_ncu_csv(ncu_result.stdout)
+            # Warn about visible metrics that NCU didn't return — usually means
+            # the metric doesn't exist on this GPU/driver combination.
+            _check_missing_metrics(metrics, warnings)
         ncu_dur_us = (time.perf_counter_ns() - ncu_start) / 1000.0
         trace_events.append(_trace_event(
             lane="phases",
@@ -594,6 +640,31 @@ def profile(
             dur_us=ncu_dur_us,
             args={"metrics_collected": len(metrics), "pipeline": pipeline},
         ))
+
+    # Warn on register spills — local memory reads/writes indicate spilling
+    # to local (off-chip) memory which severely impacts performance.
+    spill_rd = metrics.get("local_load_sectors", 0)
+    spill_wr = metrics.get("local_store_sectors", 0)
+    if spill_rd > 0 or spill_wr > 0:
+        warnings.append(
+            f"register spilling detected (local mem: {int(spill_rd)} read sectors, "
+            f"{int(spill_wr)} write sectors). Consider reducing register usage "
+            f"or using --maxrregcount."
+        )
+
+    # Cross-validate: NCU kernel duration vs our measured min latency.
+    # A >20% discrepancy usually means NCU profiled a different launch.
+    ncu_latency_us = metrics.get("latency_us", 0.0)
+    if ncu_latency_us > 0 and min_latency_us > 0:
+        ratio = ncu_latency_us / min_latency_us
+        if ratio < 0.8 or ratio > 1.25:
+            warnings.append(
+                f"NCU-reported kernel duration ({ncu_latency_us:.1f}us) differs from "
+                f"measured latency ({min_latency_us:.1f}us) by "
+                f"{abs(ratio - 1.0) * 100:.0f}%. "
+                f"NCU may have profiled a different kernel launch. "
+                f"Check --launch-skip if using a custom harness."
+            )
 
     metrics["latency_us"] = min_latency_us
     metrics.update(compute_derived_metrics(metrics))
@@ -663,6 +734,36 @@ def _run_warmup_backend(backend, binary, kernel_name, warmup, run_env):
         )
 
 
+def _run_batch(binary: str, kernel_name: str, l2_size_bytes: int, n: int, run_env: dict, timeout_sec: int = 0) -> list[float]:
+    """Run the harness with --multi-time N, returning N latency samples in one subprocess."""
+    cmd = [binary, "--kernel", kernel_name, "--multi-time", str(n)]
+    if l2_size_bytes > 0:
+        cmd.extend(["--l2-flush", str(l2_size_bytes)])
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, check=True, env=run_env,
+            timeout=timeout_sec if timeout_sec > 0 else None,
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit(
+            f"error: kernel timed out after {timeout_sec}s\n"
+            f"  binary: {binary}\n"
+            f"  increase with --timeout or check for infinite loops"
+        )
+    except subprocess.CalledProcessError as e:
+        stderr_text = (e.stderr or "").strip()
+        raise SystemExit(
+            f"error: kernel crashed during timing run (exit code {e.returncode})\n\n"
+            f"  binary: {binary}\n"
+            f"  stderr: {stderr_text}\n\n"
+            f"  this usually means:\n"
+            f"  - buffer size is too small for the kernel's access pattern\n"
+            f"  - the kernel requires a specific launch config (use --call)\n"
+            f"  - the kernel has a bug"
+        )
+    return [float(line) for line in r.stdout.strip().splitlines() if line.strip()]
+
+
 def _run_timed_legacy(
     binary,
     kernel_name,
@@ -673,28 +774,16 @@ def _run_timed_legacy(
     run_env,
     show_progress: bool = False,
     progress_label: str = "",
+    run_timeout_sec: int = 0,
 ):
     latencies: list[float] = []
     cv_pct = float("inf")
     try:
         while len(latencies) < min_runs or (cv_pct > noise_threshold and len(latencies) < max_runs):
-            try:
-                r = subprocess.run(
-                    [binary, "--kernel", kernel_name, "--iters", "1", "--l2-flush", str(l2_size_bytes)],
-                    capture_output=True, text=True, check=True, env=run_env,
-                )
-            except subprocess.CalledProcessError as e:
-                stderr_text = (e.stderr or "").strip()
-                raise SystemExit(
-                    f"error: kernel crashed during timing run (exit code {e.returncode})\n\n"
-                    f"  binary: {binary}\n"
-                    f"  stderr: {stderr_text}\n\n"
-                    f"  this usually means:\n"
-                    f"  - buffer size is too small for the kernel's access pattern\n"
-                    f"  - the kernel requires a specific launch config (use --call)\n"
-                    f"  - the kernel has a bug"
-                )
-            latencies.append(float(r.stdout.strip()))
+            remaining = max_runs - len(latencies)
+            batch_size = min(min_runs, remaining)
+            new_samples = _run_batch(binary, kernel_name, l2_size_bytes, batch_size, run_env, run_timeout_sec)
+            latencies.extend(new_samples)
             if len(latencies) >= 2:
                 cv_pct = _compute_cv(latencies)
             _emit_progress(progress_label or kernel_name, len(latencies), max_runs, cv_pct, show_progress)
@@ -778,3 +867,201 @@ def _run_timed_backend(
     finally:
         _end_progress(show_progress)
     return latencies, []
+
+
+def interleave_timing_persistent(
+    backend_a,
+    binary_a: str,
+    backend_b,
+    binary_b: str,
+    kernel_name: str,
+    min_runs: int,
+    max_runs: int,
+    noise_threshold: float,
+    gpu_id: int,
+    hardware: HardwareInfo,
+    env: dict | None = None,
+    show_progress: bool = False,
+) -> tuple[list[float], list[float], list[str]]:
+    """Interleaved timing for two persistent (e.g. Triton) backends.
+
+    Spawns both processes simultaneously and alternates send_time() calls,
+    so each pair is measured under the same GPU thermal state.
+    """
+    timing_warnings: list[str] = []
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+
+    proc_a = backend_a.spawn_persistent(binary_a, env=run_env)
+    proc_b = backend_b.spawn_persistent(binary_b, env=run_env)
+
+    latencies_a: list[float] = []
+    latencies_b: list[float] = []
+    cv_a = float("inf")
+    cv_b = float("inf")
+    rng = random.Random()
+    pair_idx = 0
+
+    try:
+        while True:
+            if len(latencies_a) >= min_runs and cv_a <= noise_threshold and cv_b <= noise_threshold:
+                break
+            if len(latencies_a) >= max_runs:
+                break
+            pair_idx += 1
+            if rng.random() < 0.5:
+                lat_a = backend_a.send_time(proc_a)
+                lat_b = backend_b.send_time(proc_b)
+            else:
+                lat_b = backend_b.send_time(proc_b)
+                lat_a = backend_a.send_time(proc_a)
+
+            latencies_a.append(lat_a)
+            latencies_b.append(lat_b)
+
+            if len(latencies_a) >= 2:
+                cv_a = _compute_cv(latencies_a)
+            if len(latencies_b) >= 2:
+                cv_b = _compute_cv(latencies_b)
+
+            if show_progress:
+                cv_text_a = f"{cv_a:.1f}%" if len(latencies_a) >= 2 else "n/a"
+                cv_text_b = f"{cv_b:.1f}%" if len(latencies_b) >= 2 else "n/a"
+                print(
+                    f"\r  timing (interleaved)...  pair {pair_idx}/{max_runs}"
+                    f"  cv_a={cv_text_a}  cv_b={cv_text_b}",
+                    end="", file=sys.stderr, flush=True,
+                )
+    finally:
+        backend_a.shutdown(proc_a)
+        backend_b.shutdown(proc_b)
+        if show_progress:
+            print(file=sys.stderr)
+
+    if cv_a > noise_threshold and len(latencies_a) >= max_runs:
+        timing_warnings.append(
+            f"noise threshold ({noise_threshold}%) not reached for v1 after "
+            f"{max_runs} pairs (cv={cv_a:.1f}%)."
+        )
+    if cv_b > noise_threshold and len(latencies_b) >= max_runs:
+        timing_warnings.append(
+            f"noise threshold ({noise_threshold}%) not reached for v2 after "
+            f"{max_runs} pairs (cv={cv_b:.1f}%)."
+        )
+
+    return latencies_a, latencies_b, timing_warnings
+
+
+def interleave_timing(
+    binary_a: str,
+    binary_b: str,
+    kernel_name: str,
+    min_runs: int,
+    max_runs: int,
+    noise_threshold: float,
+    warmup: int,
+    gpu_id: int,
+    hardware: HardwareInfo,
+    env: dict | None = None,
+    show_progress: bool = False,
+    run_timeout_sec: int = 0,
+) -> tuple[list[float], list[float], list[str]]:
+    """Time two binaries in interleaved pairs to eliminate thermal-drift bias.
+
+    For each pair the execution order (a→b or b→a) is chosen randomly so
+    neither kernel is systematically measured in a warmer GPU state.  Both
+    lists grow together one-for-one, so the returned lists are always the
+    same length.  Stops when BOTH lists satisfy the CV criterion or hit
+    max_runs.  Returns (latencies_a, latencies_b, warnings).
+    """
+    timing_warnings: list[str] = []
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+
+    l2_size_bytes = query_l2_size(gpu_id, gpu_name=hardware.gpu_name)
+    rng = random.Random()
+
+    # Warmup both before collecting timing samples.
+    _run_warmup_legacy(binary_a, kernel_name, warmup, run_env)
+    _run_warmup_legacy(binary_b, kernel_name, warmup, run_env)
+
+    latencies_a: list[float] = []
+    latencies_b: list[float] = []
+    cv_a = float("inf")
+    cv_b = float("inf")
+
+    def _run_one(binary: str) -> float:
+        try:
+            r = subprocess.run(
+                [binary, "--kernel", kernel_name, "--iters", "1",
+                 "--l2-flush", str(l2_size_bytes)],
+                capture_output=True, text=True, check=True, env=run_env,
+                timeout=run_timeout_sec if run_timeout_sec > 0 else None,
+            )
+        except subprocess.TimeoutExpired:
+            raise SystemExit(
+                f"error: kernel timed out after {run_timeout_sec}s\n"
+                f"  binary: {binary}\n"
+                f"  increase with --timeout"
+            )
+        except subprocess.CalledProcessError as e:
+            raise SystemExit(
+                f"error: kernel crashed during interleaved timing "
+                f"(exit code {e.returncode})\n"
+                f"  binary: {binary}\n"
+                f"  stderr: {(e.stderr or '').strip()}"
+            )
+        return float(r.stdout.strip())
+
+    pair_idx = 0
+    try:
+        while True:
+            enough = len(latencies_a) >= min_runs and len(latencies_b) >= min_runs
+            converged = cv_a <= noise_threshold and cv_b <= noise_threshold
+            if enough and converged:
+                break
+            if len(latencies_a) >= max_runs:
+                break
+
+            pair_idx += 1
+            if rng.random() < 0.5:
+                lat_a = _run_one(binary_a)
+                lat_b = _run_one(binary_b)
+            else:
+                lat_b = _run_one(binary_b)
+                lat_a = _run_one(binary_a)
+
+            latencies_a.append(lat_a)
+            latencies_b.append(lat_b)
+
+            if len(latencies_a) >= 2:
+                cv_a = _compute_cv(latencies_a)
+            if len(latencies_b) >= 2:
+                cv_b = _compute_cv(latencies_b)
+
+            if show_progress:
+                cv_text_a = f"{cv_a:.1f}%" if len(latencies_a) >= 2 else "n/a"
+                cv_text_b = f"{cv_b:.1f}%" if len(latencies_b) >= 2 else "n/a"
+                print(
+                    f"\r  timing (interleaved)...  pair {pair_idx}/{max_runs}"
+                    f"  cv_a={cv_text_a}  cv_b={cv_text_b}",
+                    end="", file=sys.stderr, flush=True,
+                )
+    finally:
+        if show_progress:
+            print(file=sys.stderr)
+
+    if cv_a > noise_threshold and len(latencies_a) >= max_runs:
+        timing_warnings.append(
+            f"noise threshold ({noise_threshold}%) not reached for v1 after "
+            f"{max_runs} pairs (cv={cv_a:.1f}%)."
+        )
+    if cv_b > noise_threshold and len(latencies_b) >= max_runs:
+        timing_warnings.append(
+            f"noise threshold ({noise_threshold}%) not reached for v2 after "
+            f"{max_runs} pairs (cv={cv_b:.1f}%)."
+        )
+
+    return latencies_a, latencies_b, timing_warnings

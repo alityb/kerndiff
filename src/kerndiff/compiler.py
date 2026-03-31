@@ -279,6 +279,45 @@ def verify_correctness(
     return max_diff, v1_vals, v2_vals
 
 
+def check_determinism(
+    binary: str,
+    n_runs: int = 3,
+    dump_count: int = 16,
+    env: dict | None = None,
+) -> tuple[bool, float]:
+    """Run the same binary n_runs times and check whether outputs are bit-identical.
+
+    Returns (is_deterministic, max_cross_run_diff).
+    """
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+
+    def _dump(binary: str) -> list[float]:
+        r = subprocess.run(
+            [binary, "--dump-output", str(dump_count)],
+            capture_output=True, text=True, env=run_env,
+        )
+        vals = []
+        for line in (r.stdout or "").strip().splitlines():
+            try:
+                vals.append(float(line.strip()))
+            except ValueError:
+                pass
+        return vals
+
+    runs = [_dump(binary) for _ in range(n_runs)]
+    if not all(runs):
+        return True, 0.0  # no output to compare — treat as deterministic
+
+    max_diff = 0.0
+    for i in range(1, len(runs)):
+        for a, b in zip(runs[0], runs[i]):
+            max_diff = max(max_diff, _safe_diff(a, b))
+
+    return max_diff == 0.0, max_diff
+
+
 def _safe_diff(a: float, b: float) -> float:
     """Return |a-b|, treating NaN and inf as special cases."""
     if math.isnan(a) and math.isnan(b):

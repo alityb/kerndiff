@@ -1,4 +1,4 @@
-from kerndiff.diff import compute_all_deltas, compute_delta, compute_verdict, sort_deltas
+from kerndiff.diff import compute_all_deltas, compute_delta, compute_derived_metrics, compute_verdict, sort_deltas
 from kerndiff.metrics import METRICS_BY_KEY
 
 from conftest import make_result
@@ -68,3 +68,17 @@ def test_compute_verdict_improvement():
 def test_compute_verdict_unchanged():
     verdict = compute_verdict(make_result(247.0), make_result(250.952))
     assert verdict["direction"] == "unchanged"
+
+
+def test_sm_imbalance_derived_metric():
+    """sm_imbalance should be computed as (sm_throughput / sm_occupancy) * 100."""
+    metrics = {"sm_throughput": 50.0, "sm_occupancy": 80.0, "latency_us": 100.0}
+    derived = compute_derived_metrics(metrics)
+    assert "sm_imbalance" in derived
+    assert abs(derived["sm_imbalance"] - 62.5) < 0.01
+
+
+def test_sm_imbalance_not_computed_when_occupancy_zero():
+    metrics = {"sm_throughput": 50.0, "sm_occupancy": 0.0, "latency_us": 100.0}
+    derived = compute_derived_metrics(metrics)
+    assert "sm_imbalance" not in derived

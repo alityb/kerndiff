@@ -12,10 +12,11 @@ import time
 from pathlib import Path
 
 from kerndiff.runtimes import dispatch as dispatch_runtime
-from kerndiff.compiler import compile_kernel, verify_correctness
+from kerndiff.compiler import check_determinism, compile_kernel, verify_correctness
+from kerndiff.suggestions import generate_suggestions
 from kerndiff.config import apply_config, find_config, load_config
 from kerndiff.diff import NOISE_FLOOR_LOCKED, NOISE_FLOOR_UNLOCKED, compute_all_deltas, compute_verdict, sort_deltas
-from kerndiff.profiler import MOCK_HARDWARE, lock_clocks, profile, query_hardware, query_peak_bandwidth_nvml, unlock_clocks
+from kerndiff.profiler import MOCK_HARDWARE, interleave_timing, interleave_timing_persistent, lock_clocks, profile, query_hardware, query_l2_size, query_peak_bandwidth_nvml, unlock_clocks
 from kerndiff import ptx
 from kerndiff.renderer import (
     build_json_payload, render_json, render_metric_table, render_ptx_diff,
@@ -28,6 +29,8 @@ TRITON_KERNEL_RE = re.compile(r"@triton\.jit\s+def\s+(\w+)")
 _TEMP_PATHS: list[str] = []
 _SUPPRESS_STDERR = False
 _DEFER_WARNINGS = False  # when True, collect warnings but don't print to stderr
+# Rolling history for --watch trend display (F): list of {ts, speedup, v1_us, v2_us}
+_WATCH_HISTORY: list[dict] = []
 
 
 def _cleanup_temp_paths() -> None:
@@ -262,6 +265,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-color", action="store_true")
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--arch", default="sm_90")
+    parser.add_argument(
+        "--timeout", type=int, default=0, metavar="SEC",
+        help="per-run timeout in seconds; 0 = no timeout (default: 0)",
+    )
+    parser.add_argument(
+        "--determinism", action="store_true",
+        help="run each kernel 3× and warn if outputs are non-deterministic",
+    )
+    parser.add_argument(
+        "--suggestions", action="store_true", default=True,
+        help="show actionable optimization suggestions (default: on)",
+    )
+    parser.add_argument(
+        "--no-suggestions", dest="suggestions", action="store_false",
+        help="suppress optimization suggestions",
+    )
     return parser
 
 
@@ -375,6 +394,7 @@ def _profile_variant(
     pipeline: int,
     dump_output: bool = False,
     show_progress: bool = False,
+    pre_collected_latencies: list[float] | None = None,
 ):
     result = profile(
         binary, kernel_name,
@@ -386,6 +406,8 @@ def _profile_variant(
         dump_output=dump_output,
         show_progress=show_progress,
         progress_label=label,
+        pre_collected_latencies=pre_collected_latencies,
+        run_timeout_sec=getattr(args, "timeout", 0),
     )
     _emit_status(
         f"profiling {label} {kernel_name}...",
@@ -460,6 +482,73 @@ def _run_single_kernel(
         and sys.stderr.isatty()
     )
 
+    # For CUDA kernels, use interleaved timing: alternate v1/v2 launches in
+    # random-ordered pairs so both kernels see the same GPU thermal state.
+    # Triton and mock paths fall back to sequential profiling.
+    _both_cuda = (
+        runtime_a is not None and runtime_b is not None
+        and runtime_a.__class__.__name__ == "CUDABackend"
+        and runtime_b.__class__.__name__ == "CUDABackend"
+    )
+    _both_persistent = (
+        runtime_a is not None and runtime_b is not None
+        and getattr(runtime_a, "is_persistent", lambda: False)()
+        and getattr(runtime_b, "is_persistent", lambda: False)()
+        and hasattr(runtime_a, "_last_compile_args")
+        and hasattr(runtime_b, "_last_compile_args")
+    )
+    _use_interleaved = not args.mock and (_both_cuda or _both_persistent)
+
+    pre_latencies_a: list[float] | None = None
+    pre_latencies_b: list[float] | None = None
+    run_timeout = getattr(args, "timeout", 0)
+    if _use_interleaved:
+        if runtime_a.__class__.__name__ == "CUDABackend":
+            pre_latencies_a, pre_latencies_b, timing_warnings = interleave_timing(
+                binary_a, binary_b, kernel_name,
+                min_runs=args.min_runs,
+                max_runs=args.max_runs,
+                noise_threshold=args.noise_threshold,
+                warmup=args.warmup,
+                gpu_id=physical_gpu_id,
+                hardware=hardware,
+                env=binary_env,
+                show_progress=show_progress,
+                run_timeout_sec=run_timeout,
+            )
+        else:
+            # Triton persistent: compile timed variants then interleave
+            l2_size = query_l2_size(physical_gpu_id, gpu_name=hardware.gpu_name)
+            a_args = runtime_a._last_compile_args
+            b_args = runtime_b._last_compile_args
+            timed_a = runtime_a.compile_timed(
+                a_args["source_path"], a_args["kernel_name"], a_args["arch"],
+                a_args["dtype"], a_args["buf_elems"], a_args["call_expr"],
+                iters=1, l2_flush_bytes=l2_size, warmup=args.warmup,
+            )
+            timed_b = runtime_b.compile_timed(
+                b_args["source_path"], b_args["kernel_name"], b_args["arch"],
+                b_args["dtype"], b_args["buf_elems"], b_args["call_expr"],
+                iters=1, l2_flush_bytes=l2_size, warmup=args.warmup,
+            )
+            pre_latencies_a, pre_latencies_b, timing_warnings = interleave_timing_persistent(
+                runtime_a, timed_a, runtime_b, timed_b, kernel_name,
+                min_runs=args.min_runs,
+                max_runs=args.max_runs,
+                noise_threshold=args.noise_threshold,
+                gpu_id=physical_gpu_id,
+                hardware=hardware,
+                env=binary_env,
+                show_progress=show_progress,
+            )
+
+        _emit_status(
+            "timing (interleaved)...", "ok",
+            f"{len(pre_latencies_a)} pairs",
+        )
+        for w in timing_warnings:
+            _warn(w, aggregate_warnings)
+
     result_a = _profile_variant(
         label="v1",
         mock_prefix="v1",
@@ -473,6 +562,7 @@ def _run_single_kernel(
         pipeline=pipeline,
         dump_output=_want_dump,
         show_progress=show_progress,
+        pre_collected_latencies=pre_latencies_a,
     )
 
     result_b = _profile_variant(
@@ -488,6 +578,7 @@ def _run_single_kernel(
         pipeline=pipeline,
         dump_output=_want_dump,
         show_progress=show_progress,
+        pre_collected_latencies=pre_latencies_b,
     )
 
     if do_correctness:
@@ -500,6 +591,30 @@ def _run_single_kernel(
 
     for warning in result_a.warnings + result_b.warnings:
         _warn(warning, aggregate_warnings)
+
+    # B: warn when v1 and v2 NCU runs had significantly different SM clocks,
+    # which would make rate metrics (dram_bw_gbs, sm_throughput) non-comparable.
+    mhz_a = result_a.metrics.get("actual_sm_mhz", 0.0)
+    mhz_b = result_b.metrics.get("actual_sm_mhz", 0.0)
+    if mhz_a > 0 and mhz_b > 0:
+        clock_diff_pct = abs(mhz_a - mhz_b) / max(mhz_a, mhz_b) * 100
+        if clock_diff_pct > 10:
+            _warn(
+                f"GPU SM clock differed between v1 ({mhz_a:.0f} MHz) and "
+                f"v2 ({mhz_b:.0f} MHz) NCU runs ({clock_diff_pct:.0f}% gap) — "
+                f"rate metrics may not be directly comparable; lock clocks for accuracy.",
+                aggregate_warnings,
+            )
+
+    # K: determinism check — run each kernel 3× with same inputs, compare outputs.
+    if getattr(args, "determinism", False) and not args.mock:
+        for label, binary in (("v1", binary_a), ("v2", binary_b)):
+            is_det, max_diff = check_determinism(binary, n_runs=3, env=binary_env)
+            if not is_det:
+                _emit_status(
+                    f"determinism ({label})...", "warning",
+                    f"max_diff={max_diff:.3g} across 3 runs — kernel output is non-deterministic",
+                )
 
     if _auto_check and not do_correctness:
         v1_vals = result_a.output_vals
@@ -530,7 +645,11 @@ def _run_single_kernel(
     result_b.ptx_instructions = ptx_b
 
     deltas = sort_deltas(compute_all_deltas(result_a.metrics, result_b.metrics, noise_floor=noise_floor))
-    verdict = compute_verdict(result_a, result_b, noise_floor=noise_floor)
+    verdict = compute_verdict(
+        result_a, result_b, noise_floor=noise_floor,
+        paired_latencies_a=pre_latencies_a,
+        paired_latencies_b=pre_latencies_b,
+    )
     unc = verdict.get("speedup_uncertainty_x", 0.0)
     speedup = abs(verdict.get("speedup", 1.0))
     if unc >= 0.5 and (speedup < 0.01 or unc / speedup >= 0.1):
@@ -540,12 +659,16 @@ def _run_single_kernel(
         result_a.metrics.get("dram_bw_gbs", 0.0),
         result_a.metrics.get("sm_throughput", 0.0),
         nvml_peak_bw=nvml_peak_bw,
+        arith_intensity=result_a.metrics.get("arith_intensity", 0.0),
+        tensor_core_util=result_a.metrics.get("tensor_core_util", 0.0),
     )
     roofline = compute_roofline(
         hardware.gpu_name,
         result_b.metrics.get("dram_bw_gbs", 0.0),
         result_b.metrics.get("sm_throughput", 0.0),
         nvml_peak_bw=nvml_peak_bw,
+        arith_intensity=result_b.metrics.get("arith_intensity", 0.0),
+        tensor_core_util=result_b.metrics.get("tensor_core_util", 0.0),
     )
     ptx_diff = ptx.diff_ptx(ptx_a, ptx_b)
 
@@ -615,10 +738,34 @@ def _run_single_kernel(
             ptx_section = render_ptx_diff(ptx_diff)
             if ptx_section:
                 sections.append(ptx_section)
+
+        # E: actionable suggestions
+        if getattr(args, "suggestions", True):
+            hints = generate_suggestions(deltas, result_b.metrics)
+            if hints:
+                sections.append("")
+                sections.append("  suggestions")
+                for hint in hints:
+                    sections.append(f"    · {hint}")
+
         if aggregate_warnings:
             sections.append("")
             sections.extend(_color_warn(w, use_color) for w in aggregate_warnings)
-        return "\n".join(sections)
+
+        output = "\n".join(sections)
+
+        # F: update rolling watch history so _watch_loop can show a trend
+        global _WATCH_HISTORY
+        _WATCH_HISTORY.append({
+            "ts": time.strftime("%H:%M:%S"),
+            "speedup": verdict.get("speedup", 1.0),
+            "v1_us": verdict.get("v1_latency_us", 0.0),
+            "v2_us": verdict.get("v2_latency_us", 0.0),
+        })
+        if len(_WATCH_HISTORY) > 5:
+            _WATCH_HISTORY.pop(0)
+
+        return output
 
 
 def _run_validate(
@@ -693,8 +840,10 @@ def _run_shape_sweep(
     nvml_peak_bw: float | None = None,
 ) -> str:
     """Run the diff at each shape and produce a summary table."""
+    from kerndiff.diff import _pairwise_stats
     rows = []
     pipeline = getattr(args, "pipeline", 1)
+    run_timeout = getattr(args, "timeout", 0)
     for shape in shapes:
         if not _SUPPRESS_STDERR:
             print(f"\n  --- shape={shape} ---", file=sys.stderr)
@@ -705,39 +854,42 @@ def _run_shape_sweep(
             binary_a = file_a
             binary_b = file_b
 
+        # G: use pairwise interleaved timing to keep speedup consistent with main diff
+        sweep_lats_a: list[float] | None = None
+        sweep_lats_b: list[float] | None = None
+        if not args.mock:
+            sweep_lats_a, sweep_lats_b, _ = interleave_timing(
+                binary_a, binary_b, kernel_name,
+                min_runs=args.min_runs, max_runs=args.max_runs,
+                noise_threshold=args.noise_threshold, warmup=args.warmup,
+                gpu_id=physical_gpu_id, hardware=hardware,
+                env=binary_env, run_timeout_sec=run_timeout,
+            )
+
         result_a = _profile_variant(
-            label="v1",
-            mock_prefix="v1",
-            binary=binary_a,
-            kernel_name=kernel_name,
-            args=args,
-            physical_gpu_id=physical_gpu_id,
-            hardware=hardware,
-            binary_env=binary_env,
-            runtime=None,
-            pipeline=pipeline,
+            label="v1", mock_prefix="v1", binary=binary_a,
+            kernel_name=kernel_name, args=args,
+            physical_gpu_id=physical_gpu_id, hardware=hardware,
+            binary_env=binary_env, runtime=None, pipeline=pipeline,
+            pre_collected_latencies=sweep_lats_a,
         )
         result_b = _profile_variant(
-            label="v2",
-            mock_prefix="v2",
-            binary=binary_b,
-            kernel_name=kernel_name,
-            args=args,
-            physical_gpu_id=physical_gpu_id,
-            hardware=hardware,
-            binary_env=binary_env,
-            runtime=None,
-            pipeline=pipeline,
+            label="v2", mock_prefix="v2", binary=binary_b,
+            kernel_name=kernel_name, args=args,
+            physical_gpu_id=physical_gpu_id, hardware=hardware,
+            binary_env=binary_env, runtime=None, pipeline=pipeline,
+            pre_collected_latencies=sweep_lats_b,
         )
         for w in result_a.warnings + result_b.warnings:
             _warn(w, aggregate_warnings)
 
-        speedup = result_a.min_latency_us / result_b.min_latency_us if result_b.min_latency_us else 0
+        ps = _pairwise_stats(sweep_lats_a, sweep_lats_b) if sweep_lats_a and sweep_lats_b else None
+        speedup = ps[0] if ps else (result_a.min_latency_us / result_b.min_latency_us if result_b.min_latency_us else 0)
         dram_a = result_a.metrics.get("dram_bw_gbs", 0.0)
         dram_b = result_b.metrics.get("dram_bw_gbs", 0.0)
         dram_delta = ((dram_b - dram_a) / dram_a * 100) if dram_a > 0 else 0.0
-        roofline_a = compute_roofline(hardware.gpu_name, dram_a, result_a.metrics.get("sm_throughput", 0.0), nvml_peak_bw=nvml_peak_bw)
-        roofline_b = compute_roofline(hardware.gpu_name, dram_b, result_b.metrics.get("sm_throughput", 0.0), nvml_peak_bw=nvml_peak_bw)
+        roofline_a = compute_roofline(hardware.gpu_name, dram_a, result_a.metrics.get("sm_throughput", 0.0), nvml_peak_bw=nvml_peak_bw, arith_intensity=result_a.metrics.get("arith_intensity", 0.0), tensor_core_util=result_a.metrics.get("tensor_core_util", 0.0))
+        roofline_b = compute_roofline(hardware.gpu_name, dram_b, result_b.metrics.get("sm_throughput", 0.0), nvml_peak_bw=nvml_peak_bw, arith_intensity=result_b.metrics.get("arith_intensity", 0.0), tensor_core_util=result_b.metrics.get("tensor_core_util", 0.0))
         bound_a = roofline_a.bound[:3] if roofline_a.gpu_matched else "?"
         bound_b = roofline_b.bound[:3] if roofline_b.gpu_matched else "?"
         bound_str = f"{bound_a}->{bound_b}" if bound_a != bound_b else bound_b
@@ -977,7 +1129,6 @@ def _watch_loop(args, argv: list[str] | None) -> int:
     def get_mtimes():
         return tuple(os.path.getmtime(p) if os.path.exists(p) else 0 for p in paths)
 
-    # Build argv without --watch for re-runs
     rerun_argv = [a for a in (argv or sys.argv[1:]) if a != "--watch"]
 
     last_mtimes = (0,) * len(paths)
@@ -990,6 +1141,19 @@ def _watch_loop(args, argv: list[str] | None) -> int:
                 last_mtimes = mtimes
                 ts = time.strftime("%H:%M:%S")
                 print("\033[2J\033[H", end="", flush=True)
+
+                # F: three-run trend header — shows trajectory across iterations
+                if len(_WATCH_HISTORY) >= 2:
+                    print("  recent runs:", file=sys.stderr)
+                    for h in _WATCH_HISTORY[-3:]:
+                        arrow = "↑" if h["speedup"] > 1.05 else ("↓" if h["speedup"] < 0.95 else "~")
+                        print(
+                            f"    [{h['ts']}] {arrow} {h['speedup']:.2f}x  "
+                            f"{h['v1_us']:.0f}→{h['v2_us']:.0f}µs",
+                            file=sys.stderr,
+                        )
+                    print(file=sys.stderr)
+
                 print(f"[{ts}] re-profiling...", file=sys.stderr)
                 try:
                     _run_from_argv(rerun_argv)
